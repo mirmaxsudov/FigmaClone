@@ -2,11 +2,11 @@ import { createFileRoute, Link } from '@tanstack/react-router';
 import {
   ChevronDownIcon,
   ChevronRightIcon,
-  Circle,
-  Component as ComponentIcon,
-  Copy,
-  Download,
-  Image as ImageIcon,
+  CircleIcon,
+  ComponentIcon,
+  CopyIcon,
+  DownloadIcon,
+  ImageIcon,
   Layout,
   Maximize,
   Minus,
@@ -44,7 +44,7 @@ interface Constraints {
   vertical: VerticalConstraint;
 }
 
-type ElementType = 'circle' | 'frame' | 'image' | 'instance' | 'rect' | 'text';
+type ElementType = 'circle' | 'frame' | 'group' | 'image' | 'instance' | 'rect' | 'text';
 type ResizeHandle = 'e' | 'n' | 'ne' | 'nw' | 's' | 'se' | 'sw' | 'w';
 
 interface Element {
@@ -109,6 +109,13 @@ interface ElementBounds {
   y: number;
 }
 
+interface SelectionRect {
+  height: number;
+  width: number;
+  x: number;
+  y: number;
+}
+
 const findElementById = (elements: Element[], id: string): Element | null => {
   for (const el of elements) {
     if (el.id === id) return el;
@@ -140,6 +147,50 @@ const findElementBounds = (
   return null;
 };
 
+const getTopLevelSelection = (elements: Element[], selectedSet: Set<string>): string[] => {
+  const result: string[] = [];
+  const visit = (list: Element[], ancestorSelected: boolean) => {
+    for (const el of list) {
+      const isSelected = selectedSet.has(el.id);
+      if (isSelected && !ancestorSelected) {
+        result.push(el.id);
+      }
+      const nextAncestor = ancestorSelected || isSelected;
+      if (el.children) {
+        visit(el.children, nextAncestor);
+      }
+    }
+  };
+  visit(elements, false);
+  return result;
+};
+
+const collectElementsInRect = (elements: Element[], rect: SelectionRect): string[] => {
+  const ids: string[] = [];
+  const visit = (list: Element[], offsetX: number, offsetY: number) => {
+    for (const el of list) {
+      const x = offsetX + el.x;
+      const y = offsetY + el.y;
+      const within =
+        rect.x <= x &&
+        rect.y <= y &&
+        rect.x + rect.width >= x + el.width &&
+        rect.y + rect.height >= y + el.height;
+
+      if (within) {
+        ids.push(el.id);
+      }
+
+      if (el.children) {
+        visit(el.children, x, y);
+      }
+    }
+  };
+
+  visit(elements, 0, 0);
+  return ids;
+};
+
 const findParentElement = (
   elements: Element[],
   id: string,
@@ -158,7 +209,7 @@ const findParentElement = (
 const cloneElement = (el: Element, rename = false): Element => ({
   ...el,
   id: generateId(),
-  name: rename ? `${el.name} Copy` : el.name,
+  name: rename ? `${el.name} CopyIcon` : el.name,
   children: el.children ? el.children.map((child) => cloneElement(child)) : undefined
 });
 
@@ -512,28 +563,37 @@ const FigmaLite = () => {
     return [loginFrame, homeFrame, profileFrame];
   });
   const [masters, setMasters] = useState<Record<string, Element>>({});
-  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [selectedIds, setSelectedIds] = useState<string[]>([]);
   const [zoom, setZoom] = useState(1);
   const [pan, setPan] = useState({ x: 0, y: 0 });
   const [tool, setTool] = useState<'select' | ElementType>('select');
   const [isDragging, setIsDragging] = useState(false);
   const [hoverHandle, setHoverHandle] = useState<ResizeHandle | null>(null);
   const [activeHandle, setActiveHandle] = useState<ResizeHandle | null>(null);
+  const [isSpacePressed, setIsSpacePressed] = useState(false);
+  const [selectionBox, setSelectionBox] = useState<SelectionRect | null>(null);
 
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const imageInputRef = useRef<HTMLInputElement>(null);
   const imageTargetRef = useRef<{ mode: 'new' | 'replace'; id?: string }>({ mode: 'new' });
   const imageCacheRef = useRef<Map<string, HTMLImageElement>>(new Map());
   const rafRef = useRef<number | null>(null);
-  const pendingUpdateRef = useRef<{ id: string; updates: Partial<Element> } | null>(null);
+  const pendingUpdateRef = useRef<Array<{ id: string; updates: Partial<Element> }> | null>(null);
   const dragRef = useRef<
     | {
-        mode: 'move';
-        id: string;
+        mode: 'marquee';
         startX: number;
         startY: number;
-        elX: number;
-        elY: number;
+        startWorldX: number;
+        startWorldY: number;
+        additive: boolean;
+      }
+    | {
+        mode: 'move';
+        ids: string[];
+        positions: Record<string, { x: number; y: number }>;
+        startX: number;
+        startY: number;
       }
     | {
         mode: 'pan';
@@ -557,9 +617,45 @@ const FigmaLite = () => {
     | null
   >(null);
 
+  const selectedId = selectedIds.length > 0 ? selectedIds[selectedIds.length - 1] : null;
   const selectedElement = useMemo(
     () => (selectedId ? findElementById(elements, selectedId) || masters[selectedId] : null),
     [elements, masters, selectedId]
+  );
+
+  const normalizeSelection = useCallback(
+    (ids: string[], primaryId?: string | null) => {
+      const normalized = getTopLevelSelection(elements, new Set(ids));
+      if (primaryId && normalized.includes(primaryId)) {
+        return [...normalized.filter((id) => id !== primaryId), primaryId];
+      }
+      return normalized;
+    },
+    [elements]
+  );
+
+  const setSelection = useCallback(
+    (ids: string[], primaryId?: string | null) => {
+      setSelectedIds(normalizeSelection(ids, primaryId ?? null));
+    },
+    [normalizeSelection]
+  );
+
+  const toggleSelection = useCallback(
+    (id: string) => {
+      setSelectedIds((prev) => {
+        const set = new Set(prev);
+        const has = set.has(id);
+        if (has) {
+          set.delete(id);
+        } else {
+          set.add(id);
+        }
+        const nextPrimary = has ? null : id;
+        return normalizeSelection(Array.from(set), nextPrimary);
+      });
+    },
+    [normalizeSelection]
   );
 
   const addElement = (type: ElementType) => {
@@ -596,7 +692,7 @@ const FigmaLite = () => {
     } else {
       setElements((prev) => [...prev, newEl]);
     }
-    setSelectedId(newEl.id);
+    setSelection([newEl.id], newEl.id);
   };
 
   const updateElement = useCallback(
@@ -611,25 +707,27 @@ const FigmaLite = () => {
   );
 
   const deleteSelected = () => {
-    if (selectedId) {
-      setElements((prev) => deleteElementFromList(prev, selectedId));
-      setSelectedId(null);
-    }
+    if (selectedIds.length === 0) return;
+    const topLevel = getTopLevelSelection(elements, new Set(selectedIds));
+    setElements((prev) => topLevel.reduce((acc, id) => deleteElementFromList(acc, id), prev));
+    setSelectedIds([]);
   };
 
-  const scheduleElementUpdate = useCallback(
-    (id: string, updates: Partial<Element>) => {
-      pendingUpdateRef.current = { id, updates };
+  const scheduleElementsUpdate = useCallback(
+    (updates: Array<{ id: string; updates: Partial<Element> }>) => {
+      pendingUpdateRef.current = updates;
       if (rafRef.current !== null) return;
       rafRef.current = window.requestAnimationFrame(() => {
         const pending = pendingUpdateRef.current;
         rafRef.current = null;
-        if (pending) {
-          updateElement(pending.id, pending.updates);
+        if (pending && pending.length > 0) {
+          setElements((prev) =>
+            pending.reduce((acc, item) => updateElementInList(acc, item.id, item.updates), prev)
+          );
         }
       });
     },
-    [updateElement]
+    []
   );
 
   const openImagePicker = useCallback((mode: 'new' | 'replace', id?: string) => {
@@ -690,7 +788,7 @@ const FigmaLite = () => {
         }
 
         imageCacheRef.current.set(src, img);
-        setSelectedId(newEl.id);
+        setSelection([newEl.id], newEl.id);
       };
       img.src = src;
     },
@@ -797,23 +895,134 @@ const FigmaLite = () => {
     if (masters[selectedId]) {
       const clone = cloneElement(masters[selectedId], true);
       setMasters((prev) => ({ ...prev, [clone.id]: clone }));
-      setSelectedId(clone.id);
+      setSelection([clone.id], clone.id);
       return;
     }
 
     const result = duplicateElementInList(elements, selectedId);
     if (result.duplicated) {
       setElements(result.elements);
-      setSelectedId(result.duplicated.id);
+      setSelection([result.duplicated.id], result.duplicated.id);
     }
-  }, [duplicateElementInList, elements, masters, selectedElement, selectedId]);
+  }, [duplicateElementInList, elements, masters, selectedElement, selectedId, setSelection]);
+
+  const groupSelected = useCallback(() => {
+    if (selectedIds.length < 2) return;
+    const topLevel = getTopLevelSelection(elements, new Set(selectedIds));
+    if (topLevel.length < 2) return;
+
+    const parent = findParentElement(elements, topLevel[0]);
+    const parentId = parent?.id ?? null;
+    const sameParent = topLevel.every(
+      (id) => (findParentElement(elements, id)?.id ?? null) === parentId
+    );
+
+    if (!sameParent) {
+      toast.error('Select layers with the same parent to group');
+      return;
+    }
+
+    const sourceList = parent ? parent.children || [] : elements;
+    const selectedSet = new Set(topLevel);
+    const selectedElements = sourceList.filter((el) => selectedSet.has(el.id));
+    if (selectedElements.length < 2) return;
+
+    const minX = Math.min(...selectedElements.map((el) => el.x));
+    const minY = Math.min(...selectedElements.map((el) => el.y));
+    const maxX = Math.max(...selectedElements.map((el) => el.x + el.width));
+    const maxY = Math.max(...selectedElements.map((el) => el.y + el.height));
+
+    const groupChildren = selectedElements.map((el) => ({
+      ...el,
+      x: el.x - minX,
+      y: el.y - minY
+    }));
+
+    const group: Element = {
+      id: generateId(),
+      name: `Group ${elements.length + 1}`,
+      type: 'group',
+      x: minX,
+      y: minY,
+      width: maxX - minX,
+      height: maxY - minY,
+      fill: '#ffffff',
+      stroke: '',
+      strokeWidth: 0,
+      opacity: 1,
+      constraints: { horizontal: 'left', vertical: 'top' },
+      children: groupChildren
+    };
+
+    const insertIndex = sourceList.findIndex((el) => selectedSet.has(el.id));
+    const nextList = sourceList.filter((el) => !selectedSet.has(el.id));
+    nextList.splice(Math.max(0, insertIndex), 0, group);
+
+    if (parent) {
+      setElements((prev) => updateElementInList(prev, parent.id, { children: nextList }));
+    } else {
+      setElements(nextList);
+    }
+
+    setSelection([group.id], group.id);
+  }, [elements, selectedIds, setSelection]);
+
+  const ungroupSelected = useCallback(() => {
+    if (selectedIds.length === 0) return;
+    const topLevel = getTopLevelSelection(elements, new Set(selectedIds));
+    const selectedSet = new Set(topLevel);
+    const retained = topLevel.filter((id) => {
+      const el = findElementById(elements, id);
+      return el?.type !== 'group';
+    });
+    let nextSelection: string[] = [...retained];
+
+    const ungroupList = (list: Element[]): Element[] => {
+      const result: Element[] = [];
+      for (const el of list) {
+        if (selectedSet.has(el.id) && el.type === 'group') {
+          const children = (el.children || []).map((child) => ({
+            ...child,
+            x: child.x + el.x,
+            y: child.y + el.y
+          }));
+          nextSelection = nextSelection.concat(children.map((child) => child.id));
+          result.push(...children);
+          continue;
+        }
+        if (el.children) {
+          result.push({ ...el, children: ungroupList(el.children) });
+        } else {
+          result.push(el);
+        }
+      }
+      return result;
+    };
+
+    setElements((prev) => ungroupList(prev));
+    if (nextSelection.length > 0) {
+      setSelection(nextSelection, nextSelection[nextSelection.length - 1]);
+    } else {
+      setSelectedIds([]);
+    }
+  }, [elements, selectedIds, setSelection]);
 
   const nudgeSelected = useCallback(
     (dx: number, dy: number) => {
-      if (!selectedId || !selectedElement) return;
-      updateElement(selectedId, { x: selectedElement.x + dx, y: selectedElement.y + dy });
+      if (selectedIds.length === 0) return;
+      const topLevel = getTopLevelSelection(elements, new Set(selectedIds));
+      const updates: Array<{ id: string; updates: Partial<Element> }> = [];
+      for (const id of topLevel) {
+        const el = findElementById(elements, id);
+        if (!el) continue;
+        updates.push({ id, updates: { x: el.x + dx, y: el.y + dy } });
+      }
+
+      if (updates.length > 0) {
+        scheduleElementsUpdate(updates);
+      }
     },
-    [selectedElement, selectedId, updateElement]
+    [elements, scheduleElementsUpdate, selectedIds]
   );
 
   const alignSelected = useCallback(
@@ -916,7 +1125,7 @@ const FigmaLite = () => {
 
   const getResizeHandleAtPoint = useCallback(
     (point: { x: number; y: number }) => {
-      if (!selectedId || !selectedElement) return null;
+      if (!selectedId || !selectedElement || selectedIds.length !== 1) return null;
       const bounds = findElementBounds(elements, selectedId);
       if (!bounds) return null;
 
@@ -948,7 +1157,7 @@ const FigmaLite = () => {
       }
       return null;
     },
-    [elements, selectedElement, selectedId, zoom]
+    [elements, selectedElement, selectedId, selectedIds, zoom]
   );
 
   const handlePointerDown = (e: React.PointerEvent<HTMLCanvasElement>) => {
@@ -958,6 +1167,7 @@ const FigmaLite = () => {
     if (resizeHandle && selectedId && selectedElement) {
       setIsDragging(true);
       setActiveHandle(resizeHandle);
+      setSelectionBox(null);
       dragRef.current = {
         mode: 'resize',
         id: selectedId,
@@ -977,28 +1187,69 @@ const FigmaLite = () => {
     const hit = hitTestElements(point);
 
     if (hit) {
-      setSelectedId(hit.id);
+      if (e.shiftKey) {
+        toggleSelection(hit.id);
+        return;
+      }
+
+      const hitAlreadySelected = selectedIds.includes(hit.id);
+      if (!hitAlreadySelected) {
+        setSelection([hit.id], hit.id);
+      } else {
+        setSelection(selectedIds, hit.id);
+      }
+
+      const moveIds = hitAlreadySelected
+        ? getTopLevelSelection(elements, new Set(selectedIds))
+        : [hit.id];
+      const positions: Record<string, { x: number; y: number }> = {};
+      const validIds: string[] = [];
+      for (const id of moveIds) {
+        const el = findElementById(elements, id);
+        if (el) {
+          positions[id] = { x: el.x, y: el.y };
+          validIds.push(id);
+        }
+      }
+
       setIsDragging(true);
       setActiveHandle(null);
+      setSelectionBox(null);
       dragRef.current = {
         mode: 'move',
-        id: hit.id,
+        ids: validIds,
+        positions,
         startX: e.clientX,
-        startY: e.clientY,
-        elX: hit.x,
-        elY: hit.y
+        startY: e.clientY
       };
     } else {
-      setSelectedId(null);
-      setIsDragging(true);
-      setActiveHandle(null);
-      dragRef.current = {
-        mode: 'pan',
-        startX: e.clientX,
-        startY: e.clientY,
-        elX: pan.x,
-        elY: pan.y
-      };
+      if (isSpacePressed || e.button === 1) {
+        setIsDragging(true);
+        setActiveHandle(null);
+        setSelectionBox(null);
+        dragRef.current = {
+          mode: 'pan',
+          startX: e.clientX,
+          startY: e.clientY,
+          elX: pan.x,
+          elY: pan.y
+        };
+      } else {
+        if (!e.shiftKey) {
+          setSelectedIds([]);
+        }
+        setIsDragging(true);
+        setActiveHandle(null);
+        dragRef.current = {
+          mode: 'marquee',
+          startX: e.clientX,
+          startY: e.clientY,
+          startWorldX: point.x,
+          startWorldY: point.y,
+          additive: e.shiftKey
+        };
+        setSelectionBox({ x: point.x, y: point.y, width: 0, height: 0 });
+      }
     }
     (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
   };
@@ -1020,7 +1271,25 @@ const FigmaLite = () => {
     }
 
     if (state.mode === 'move') {
-      scheduleElementUpdate(state.id, { x: state.elX + dx, y: state.elY + dy });
+      const updates: Array<{ id: string; updates: Partial<Element> }> = [];
+      for (const id of state.ids) {
+        const position = state.positions[id];
+        if (!position) continue;
+        updates.push({ id, updates: { x: position.x + dx, y: position.y + dy } });
+      }
+
+      if (updates.length > 0) {
+        scheduleElementsUpdate(updates);
+      }
+      return;
+    }
+
+    if (state.mode === 'marquee') {
+      const nextX = Math.min(state.startWorldX, point.x);
+      const nextY = Math.min(state.startWorldY, point.y);
+      const nextW = Math.abs(point.x - state.startWorldX);
+      const nextH = Math.abs(point.y - state.startWorldY);
+      setSelectionBox({ x: nextX, y: nextY, width: nextW, height: nextH });
       return;
     }
 
@@ -1126,15 +1395,40 @@ const FigmaLite = () => {
         }
       }
 
-      scheduleElementUpdate(state.id, { x: left, y: top, width, height });
+      scheduleElementsUpdate([{ id: state.id, updates: { x: left, y: top, width, height } }]);
     }
   };
 
-  const handlePointerUp = () => {
+  const handlePointerUp = (e?: React.PointerEvent<HTMLCanvasElement>) => {
+    const state = dragRef.current;
+    if (state?.mode === 'marquee') {
+      const endPoint = e ? getCanvasPoint(e) : { x: state.startWorldX, y: state.startWorldY };
+      const rect: SelectionRect = {
+        x: Math.min(state.startWorldX, endPoint.x),
+        y: Math.min(state.startWorldY, endPoint.y),
+        width: Math.abs(endPoint.x - state.startWorldX),
+        height: Math.abs(endPoint.y - state.startWorldY)
+      };
+      const isClick = rect.width < 2 && rect.height < 2;
+      if (!isClick) {
+        const ids = collectElementsInRect(elements, rect);
+        setSelectedIds((prev) => {
+          const base = state.additive ? prev : [];
+          const merged = [...base, ...ids];
+          const primary = ids.length > 0 ? ids[ids.length - 1] : null;
+          return normalizeSelection(merged, primary);
+        });
+      } else if (!state.additive) {
+        setSelectedIds([]);
+      }
+      setSelectionBox(null);
+    }
+
     dragRef.current = null;
     setIsDragging(false);
     setActiveHandle(null);
     setHoverHandle(null);
+    setSelectionBox(null);
   };
 
   useEffect(() => {
@@ -1197,7 +1491,9 @@ const FigmaLite = () => {
 
     const renderSVGElement = (el: Element): string => {
       let content = '';
-      if (el.type === 'rect' || el.type === 'frame' || el.type === 'instance') {
+      if (el.type === 'group') {
+        // groups are visual containers only
+      } else if (el.type === 'rect' || el.type === 'frame' || el.type === 'instance') {
         content = `<rect x="${el.x}" y="${el.y}" width="${el.width}" height="${el.height}" fill="${el.fill}" stroke="${el.stroke}" stroke-width="${el.strokeWidth}" fill-opacity="${el.opacity}" />`;
       } else if (el.type === 'circle') {
         content = `<circle cx="${el.x + el.width / 2}" cy="${el.y + el.height / 2}" r="${el.width / 2}" fill="${el.fill}" stroke="${el.stroke}" stroke-width="${el.strokeWidth}" fill-opacity="${el.opacity}" />`;
@@ -1303,7 +1599,7 @@ const FigmaLite = () => {
       const x = offsetX + el.x;
       const y = offsetY + el.y;
       const isFrame = el.type === 'frame';
-      const isSelected = selectedId === el.id;
+      const isSelected = selectedIds.includes(el.id);
 
       ctx.save();
       ctx.globalAlpha = el.opacity;
@@ -1445,24 +1741,26 @@ const FigmaLite = () => {
         ctx.strokeStyle = '#3b82f6';
         ctx.lineWidth = 2 / zoom;
         ctx.strokeRect(x - 1, y - 1, el.width + 2, el.height + 2);
-        const handleSize = HANDLE_SIZE / zoom;
-        const half = handleSize / 2;
-        const handles: Array<{ x: number; y: number }> = [
-          { x, y },
-          { x: x + el.width / 2, y },
-          { x: x + el.width, y },
-          { x: x + el.width, y: y + el.height / 2 },
-          { x: x + el.width, y: y + el.height },
-          { x: x + el.width / 2, y: y + el.height },
-          { x, y: y + el.height },
-          { x, y: y + el.height / 2 }
-        ];
-        ctx.fillStyle = '#ffffff';
-        ctx.strokeStyle = '#3b82f6';
-        ctx.lineWidth = 1 / zoom;
-        for (const handle of handles) {
-          ctx.fillRect(handle.x - half, handle.y - half, handleSize, handleSize);
-          ctx.strokeRect(handle.x - half, handle.y - half, handleSize, handleSize);
+        if (selectedIds.length === 1) {
+          const handleSize = HANDLE_SIZE / zoom;
+          const half = handleSize / 2;
+          const handles: Array<{ x: number; y: number }> = [
+            { x, y },
+            { x: x + el.width / 2, y },
+            { x: x + el.width, y },
+            { x: x + el.width, y: y + el.height / 2 },
+            { x: x + el.width, y: y + el.height },
+            { x: x + el.width / 2, y: y + el.height },
+            { x, y: y + el.height },
+            { x, y: y + el.height / 2 }
+          ];
+          ctx.fillStyle = '#ffffff';
+          ctx.strokeStyle = '#3b82f6';
+          ctx.lineWidth = 1 / zoom;
+          for (const handle of handles) {
+            ctx.fillRect(handle.x - half, handle.y - half, handleSize, handleSize);
+            ctx.strokeRect(handle.x - half, handle.y - half, handleSize, handleSize);
+          }
         }
         ctx.restore();
       }
@@ -1472,8 +1770,18 @@ const FigmaLite = () => {
       drawElement(el, 0, 0);
     }
 
+    if (selectionBox) {
+      ctx.save();
+      ctx.strokeStyle = '#3b82f6';
+      ctx.fillStyle = 'rgba(59, 130, 246, 0.12)';
+      ctx.lineWidth = 1 / zoom;
+      ctx.fillRect(selectionBox.x, selectionBox.y, selectionBox.width, selectionBox.height);
+      ctx.strokeRect(selectionBox.x, selectionBox.y, selectionBox.width, selectionBox.height);
+      ctx.restore();
+    }
+
     ctx.restore();
-  }, [elements, pan.x, pan.y, selectedId, zoom]);
+  }, [elements, pan.x, pan.y, selectedIds, selectionBox, zoom]);
 
   useEffect(() => {
     drawScene();
@@ -1496,8 +1804,24 @@ const FigmaLite = () => {
     const handleKeyDown = (e: KeyboardEvent) => {
       if (isEditableTarget(e.target)) return;
 
+      if (e.code === 'Space') {
+        e.preventDefault();
+        setIsSpacePressed(true);
+        return;
+      }
+
       const mod = e.ctrlKey || e.metaKey;
       const key = e.key.toLowerCase();
+
+      if (mod && key === 'g') {
+        e.preventDefault();
+        if (e.shiftKey) {
+          ungroupSelected();
+        } else {
+          groupSelected();
+        }
+        return;
+      }
 
       if (mod && e.shiftKey) {
         if (key === 'l') {
@@ -1574,15 +1898,27 @@ const FigmaLite = () => {
       }
     };
 
+    const handleKeyUp = (e: KeyboardEvent) => {
+      if (e.code === 'Space') {
+        setIsSpacePressed(false);
+      }
+    };
+
     window.addEventListener('keydown', handleKeyDown);
-    return () => window.removeEventListener('keydown', handleKeyDown);
+    window.addEventListener('keyup', handleKeyUp);
+    return () => {
+      window.removeEventListener('keydown', handleKeyDown);
+      window.removeEventListener('keyup', handleKeyUp);
+    };
   }, [
     alignSelected,
     deleteSelected,
     duplicateSelected,
+    groupSelected,
     nudgeSelected,
     selectedElement,
     selectedId,
+    ungroupSelected,
     zoom,
     zoomToCenter
   ]);
@@ -1590,7 +1926,7 @@ const FigmaLite = () => {
   const LayerItem = ({ el, depth = 0 }: { el: Element; depth?: number }) => {
     const [isOpen, setIsOpen] = useState(true);
     const hasChildren = el.children && el.children.length > 0;
-    const isSelected = selectedId === el.id;
+    const isSelected = selectedIds.includes(el.id);
 
     return (
       <div>
@@ -1602,7 +1938,11 @@ const FigmaLite = () => {
           style={{ paddingLeft: `${depth * 12 + 8}px` }}
           onClick={(e) => {
             e.stopPropagation();
-            setSelectedId(el.id);
+            if (e.shiftKey) {
+              toggleSelection(el.id);
+            } else {
+              setSelection([el.id], el.id);
+            }
           }}
         >
           {hasChildren ? (
@@ -1623,7 +1963,8 @@ const FigmaLite = () => {
           )}
           {el.type === 'frame' && <Monitor className='h-3 w-3' />}
           {el.type === 'rect' && <Square className='h-3 w-3' />}
-          {el.type === 'circle' && <Circle className='h-3 w-3' />}
+          {el.type === 'circle' && <CircleIcon className='h-3 w-3' />}
+          {el.type === 'group' && <Layout className='h-3 w-3' />}
           {el.type === 'image' && <ImageIcon className='h-3 w-3' />}
           {el.type === 'text' && <Type className='h-3 w-3' />}
           {el.type === 'instance' && <ComponentIcon className='h-3 w-3 text-purple-500' />}
@@ -1685,7 +2026,7 @@ const FigmaLite = () => {
               variant='ghost'
               onClick={() => addElement('circle')}
             >
-              <Circle className='h-4 w-4' />
+              <CircleIcon className='h-4 w-4' />
             </Button>
             <Button
               className='h-8 w-8'
@@ -1731,16 +2072,16 @@ const FigmaLite = () => {
 
         <div className='flex items-center gap-2'>
           <Button className='h-8' size='sm' variant='outline' onClick={exportJSON}>
-            <Download className='mr-2 h-3.5 w-3.5' /> JSON
+            <DownloadIcon className='mr-2 h-3.5 w-3.5' /> JSON
           </Button>
           <Button className='h-8' size='sm' variant='outline' onClick={exportSVG}>
-            <Copy className='mr-2 h-3.5 w-3.5' /> SVG
+            <CopyIcon className='mr-2 h-3.5 w-3.5' /> SVG
           </Button>
         </div>
       </header>
       <div className='flex flex-1 overflow-hidden'>
-        <aside className='z-10 flex w-64 shrink-0 flex-col border-r bg-white'>
-          <Tabs className='flex flex-1 flex-col' defaultValue='layers'>
+        <aside className='z-10 flex min-h-0 w-64 shrink-0 flex-col border-r bg-white'>
+          <Tabs className='flex min-h-0 flex-1 flex-col' defaultValue='layers'>
             <TabsList className='h-10 w-full justify-start rounded-none border-b bg-transparent px-2'>
               <TabsTrigger
                 className='h-full rounded-none border-b-2 border-transparent text-xs data-[state=active]:border-blue-600'
@@ -1755,7 +2096,10 @@ const FigmaLite = () => {
                 Assets
               </TabsTrigger>
             </TabsList>
-            <TabsContent className='m-0 flex flex-1 flex-col overflow-hidden p-0' value='layers'>
+            <TabsContent
+              className='m-0 flex min-h-0 flex-1 flex-col overflow-hidden p-0'
+              value='layers'
+            >
               <ScrollArea className='flex-1'>
                 <div className='py-2'>
                   {elements.map((el) => (
@@ -1785,7 +2129,6 @@ const FigmaLite = () => {
         </aside>
         <canvas
           ref={canvasRef}
-          className='relative w-[130vh] flex-1 touch-none bg-[#e5e5e5]'
           style={{
             cursor: activeHandle
               ? cursorForHandle(activeHandle)
@@ -1795,6 +2138,7 @@ const FigmaLite = () => {
                   ? 'grabbing'
                   : 'grab'
           }}
+          className='relative w-[130vh] flex-1 touch-none bg-[#e5e5e5]'
           onPointerCancel={handlePointerUp}
           onPointerDown={handlePointerDown}
           onPointerLeave={handlePointerUp}
@@ -1802,8 +2146,8 @@ const FigmaLite = () => {
           onPointerUp={handlePointerUp}
           onWheel={handleWheel}
         />
-        <aside className='z-10 flex w-72 shrink-0 flex-col border-l bg-white'>
-          <Tabs className='flex flex-1 flex-col' defaultValue='design'>
+        <aside className='z-10 flex min-h-0 w-72 shrink-0 flex-col border-l bg-white'>
+          <Tabs className='flex min-h-0 flex-1 flex-col' defaultValue='design'>
             <TabsList className='h-10 w-full justify-start rounded-none border-b bg-transparent px-2'>
               <TabsTrigger
                 className='h-full rounded-none border-b-2 border-transparent text-xs data-[state=active]:border-blue-600'
@@ -1818,280 +2162,286 @@ const FigmaLite = () => {
                 Prototype
               </TabsTrigger>
             </TabsList>
-            <TabsContent className='m-0 flex-1 overflow-auto p-0' value='design'>
-              {selectedElement ? (
-                <div className='space-y-6 p-4'>
-                  <div className='space-y-3'>
-                    <h3 className='text-[10px] font-bold text-slate-400 uppercase'>Layout</h3>
-                    <div className='grid grid-cols-2 gap-x-4 gap-y-2'>
-                      <div className='flex items-center gap-2'>
-                        <span className='w-4 font-mono text-[10px] text-slate-400'>X</span>
-                        <Input
-                          className='h-7 px-2 text-xs'
-                          type='number'
-                          value={Math.round(selectedElement.x)}
-                          onChange={(e) =>
-                            updateElement(selectedId!, { x: Number(e.target.value) })
-                          }
-                        />
-                      </div>
-                      <div className='flex items-center gap-2'>
-                        <span className='w-4 font-mono text-[10px] text-slate-400'>Y</span>
-                        <Input
-                          className='h-7 px-2 text-xs'
-                          type='number'
-                          value={Math.round(selectedElement.y)}
-                          onChange={(e) =>
-                            updateElement(selectedId!, { y: Number(e.target.value) })
-                          }
-                        />
-                      </div>
-                      <div className='flex items-center gap-2'>
-                        <span className='w-4 font-mono text-[10px] text-slate-400'>W</span>
-                        <Input
-                          className='h-7 px-2 text-xs'
-                          type='number'
-                          value={Math.round(selectedElement.width)}
-                          onChange={(e) =>
-                            updateElement(selectedId!, { width: Number(e.target.value) })
-                          }
-                        />
-                      </div>
-                      <div className='flex items-center gap-2'>
-                        <span className='w-4 font-mono text-[10px] text-slate-400'>H</span>
-                        <Input
-                          className='h-7 px-2 text-xs'
-                          type='number'
-                          value={Math.round(selectedElement.height)}
-                          onChange={(e) =>
-                            updateElement(selectedId!, { height: Number(e.target.value) })
-                          }
-                        />
-                      </div>
-                    </div>
-                  </div>
-                  <Separator />
-                  <div className='space-y-3'>
-                    <h3 className='text-[10px] font-bold text-slate-400 uppercase'>Constraints</h3>
-                    <div className='grid grid-cols-1 gap-2'>
-                      <div className='space-y-1'>
-                        <Label className='text-[10px]'>Horizontal</Label>
-                        <Select
-                          value={selectedElement.constraints.horizontal}
-                          onValueChange={(v) =>
-                            updateElement(selectedId!, {
-                              constraints: {
-                                ...selectedElement.constraints,
-                                horizontal: v as HorizontalConstraint
-                              }
-                            })
-                          }
-                        >
-                          <SelectTrigger className='h-8 text-xs'>
-                            <SelectValue />
-                          </SelectTrigger>
-                          <SelectContent>
-                            <SelectItem value='left'>Left</SelectItem>
-                            <SelectItem value='right'>Right</SelectItem>
-                            <SelectItem value='both'>Left & Right</SelectItem>
-                            <SelectItem value='center'>Center</SelectItem>
-                            <SelectItem value='scale'>Scale</SelectItem>
-                          </SelectContent>
-                        </Select>
-                      </div>
-                      <div className='space-y-1'>
-                        <Label className='text-[10px]'>Vertical</Label>
-                        <Select
-                          value={selectedElement.constraints.vertical}
-                          onValueChange={(v) =>
-                            updateElement(selectedId!, {
-                              constraints: {
-                                ...selectedElement.constraints,
-                                vertical: v as VerticalConstraint
-                              }
-                            })
-                          }
-                        >
-                          <SelectTrigger className='h-8 text-xs'>
-                            <SelectValue />
-                          </SelectTrigger>
-                          <SelectContent>
-                            <SelectItem value='top'>Top</SelectItem>
-                            <SelectItem value='bottom'>Bottom</SelectItem>
-                            <SelectItem value='both'>Top & Bottom</SelectItem>
-                            <SelectItem value='center'>Center</SelectItem>
-                            <SelectItem value='scale'>Scale</SelectItem>
-                          </SelectContent>
-                        </Select>
+            <TabsContent
+              className='m-0 flex min-h-0 flex-1 flex-col overflow-hidden p-0'
+              value='design'
+            >
+              <ScrollArea className='flex-1'>
+                {selectedElement ? (
+                  <div className='space-y-6 p-4'>
+                    <div className='space-y-3'>
+                      <h3 className='text-[10px] font-bold text-slate-400 uppercase'>Layout</h3>
+                      <div className='grid grid-cols-2 gap-x-4 gap-y-2'>
+                        <div className='flex items-center gap-2'>
+                          <span className='w-4 font-mono text-[10px] text-slate-400'>X</span>
+                          <Input
+                            className='h-7 px-2 text-xs'
+                            type='number'
+                            value={Math.round(selectedElement.x)}
+                            onChange={(e) =>
+                              updateElement(selectedId!, { x: Number(e.target.value) })
+                            }
+                          />
+                        </div>
+                        <div className='flex items-center gap-2'>
+                          <span className='w-4 font-mono text-[10px] text-slate-400'>Y</span>
+                          <Input
+                            className='h-7 px-2 text-xs'
+                            type='number'
+                            value={Math.round(selectedElement.y)}
+                            onChange={(e) =>
+                              updateElement(selectedId!, { y: Number(e.target.value) })
+                            }
+                          />
+                        </div>
+                        <div className='flex items-center gap-2'>
+                          <span className='w-4 font-mono text-[10px] text-slate-400'>W</span>
+                          <Input
+                            className='h-7 px-2 text-xs'
+                            type='number'
+                            value={Math.round(selectedElement.width)}
+                            onChange={(e) =>
+                              updateElement(selectedId!, { width: Number(e.target.value) })
+                            }
+                          />
+                        </div>
+                        <div className='flex items-center gap-2'>
+                          <span className='w-4 font-mono text-[10px] text-slate-400'>H</span>
+                          <Input
+                            className='h-7 px-2 text-xs'
+                            type='number'
+                            value={Math.round(selectedElement.height)}
+                            onChange={(e) =>
+                              updateElement(selectedId!, { height: Number(e.target.value) })
+                            }
+                          />
+                        </div>
                       </div>
                     </div>
-                  </div>
-                  <Separator />
-                  <div className='space-y-3'>
-                    <h3 className='text-[10px] font-bold text-slate-400 uppercase'>Fill</h3>
-                    <div className='flex items-center gap-2'>
-                      <Input
-                        className='h-8 w-12 border-none bg-transparent p-1'
-                        type='color'
-                        value={selectedElement.fill}
-                        onChange={(e) => updateElement(selectedId!, { fill: e.target.value })}
-                      />
-                      <Input
-                        className='h-8 flex-1 text-xs'
-                        type='text'
-                        value={selectedElement.fill}
-                        onChange={(e) => updateElement(selectedId!, { fill: e.target.value })}
-                      />
-                      <div className='w-8 text-[10px] text-slate-400'>
-                        {Math.round(selectedElement.opacity * 100)}%
+                    <Separator />
+                    <div className='space-y-3'>
+                      <h3 className='text-[10px] font-bold text-slate-400 uppercase'>Constraints</h3>
+                      <div className='grid grid-cols-1 gap-2'>
+                        <div className='space-y-1'>
+                          <Label className='text-[10px]'>Horizontal</Label>
+                          <Select
+                            value={selectedElement.constraints.horizontal}
+                            onValueChange={(v) =>
+                              updateElement(selectedId!, {
+                                constraints: {
+                                  ...selectedElement.constraints,
+                                  horizontal: v as HorizontalConstraint
+                                }
+                              })
+                            }
+                          >
+                            <SelectTrigger className='h-8 text-xs'>
+                              <SelectValue />
+                            </SelectTrigger>
+                            <SelectContent>
+                              <SelectItem value='left'>Left</SelectItem>
+                              <SelectItem value='right'>Right</SelectItem>
+                              <SelectItem value='both'>Left & Right</SelectItem>
+                              <SelectItem value='center'>Center</SelectItem>
+                              <SelectItem value='scale'>Scale</SelectItem>
+                            </SelectContent>
+                          </Select>
+                        </div>
+                        <div className='space-y-1'>
+                          <Label className='text-[10px]'>Vertical</Label>
+                          <Select
+                            value={selectedElement.constraints.vertical}
+                            onValueChange={(v) =>
+                              updateElement(selectedId!, {
+                                constraints: {
+                                  ...selectedElement.constraints,
+                                  vertical: v as VerticalConstraint
+                                }
+                              })
+                            }
+                          >
+                            <SelectTrigger className='h-8 text-xs'>
+                              <SelectValue />
+                            </SelectTrigger>
+                            <SelectContent>
+                              <SelectItem value='top'>Top</SelectItem>
+                              <SelectItem value='bottom'>Bottom</SelectItem>
+                              <SelectItem value='both'>Top & Bottom</SelectItem>
+                              <SelectItem value='center'>Center</SelectItem>
+                              <SelectItem value='scale'>Scale</SelectItem>
+                            </SelectContent>
+                          </Select>
+                        </div>
                       </div>
                     </div>
-                    {selectedElement.type === 'image' && (
-                      <div className='space-y-2 pt-2'>
-                        <Label className='text-[10px]'>Image Fit</Label>
-                        <Select
-                          value={selectedElement.imageFit || 'contain'}
-                          onValueChange={(v) =>
-                            updateElement(selectedId!, {
-                              imageFit: v as 'contain' | 'cover' | 'fill'
-                            })
-                          }
-                        >
-                          <SelectTrigger className='h-8 text-xs'>
-                            <SelectValue />
-                          </SelectTrigger>
-                          <SelectContent>
-                            <SelectItem value='contain'>Contain</SelectItem>
-                            <SelectItem value='cover'>Cover</SelectItem>
-                            <SelectItem value='fill'>Fill</SelectItem>
-                          </SelectContent>
-                        </Select>
-                        <Button
-                          className='w-full'
-                          size='sm'
-                          variant='outline'
-                          onClick={() => openImagePicker('replace', selectedId!)}
-                        >
-                          Replace Image
-                        </Button>
+                    <Separator />
+                    <div className='space-y-3'>
+                      <h3 className='text-[10px] font-bold text-slate-400 uppercase'>Fill</h3>
+                      <div className='flex items-center gap-2'>
+                        <Input
+                          className='h-8 w-12 border-none bg-transparent p-1'
+                          type='color'
+                          value={selectedElement.fill}
+                          onChange={(e) => updateElement(selectedId!, { fill: e.target.value })}
+                        />
+                        <Input
+                          className='h-8 flex-1 text-xs'
+                          type='text'
+                          value={selectedElement.fill}
+                          onChange={(e) => updateElement(selectedId!, { fill: e.target.value })}
+                        />
+                        <div className='w-8 text-[10px] text-slate-400'>
+                          {Math.round(selectedElement.opacity * 100)}%
+                        </div>
                       </div>
-                    )}
-                    {selectedElement.type === 'text' && (
-                      <div className='space-y-2 pt-2'>
-                        <Label className='text-[10px]'>Font Size</Label>
-                        <Input
-                          className='h-8 text-xs'
-                          type='number'
-                          value={selectedElement.fontSize}
-                          onChange={(e) =>
-                            updateElement(selectedId!, { fontSize: Number(e.target.value) })
-                          }
-                        />
-                        <Label className='text-[10px]'>Font Family</Label>
-                        <Select
-                          value={
-                            selectedElement.fontFamily || 'ui-sans-serif, system-ui, -apple-system'
-                          }
-                          onValueChange={(v) => updateElement(selectedId!, { fontFamily: v })}
-                        >
-                          <SelectTrigger className='h-8 text-xs'>
-                            <SelectValue />
-                          </SelectTrigger>
-                          <SelectContent>
-                            <SelectItem value='ui-sans-serif, system-ui, -apple-system'>
-                              Sans
-                            </SelectItem>
-                            <SelectItem value='ui-serif, Georgia, serif'>Serif</SelectItem>
-                            <SelectItem value='ui-monospace, SFMono-Regular, Menlo, monospace'>
-                              Mono
-                            </SelectItem>
-                            <SelectItem value='Arial, Helvetica, sans-serif'>Arial</SelectItem>
-                            <SelectItem value='Georgia, serif'>Georgia</SelectItem>
-                          </SelectContent>
-                        </Select>
-                        <Label className='text-[10px]'>Font Weight</Label>
-                        <Select
-                          value={String(selectedElement.fontWeight || 400)}
-                          onValueChange={(v) =>
-                            updateElement(selectedId!, { fontWeight: Number(v) })
-                          }
-                        >
-                          <SelectTrigger className='h-8 text-xs'>
-                            <SelectValue />
-                          </SelectTrigger>
-                          <SelectContent>
-                            <SelectItem value='300'>Light</SelectItem>
-                            <SelectItem value='400'>Regular</SelectItem>
-                            <SelectItem value='500'>Medium</SelectItem>
-                            <SelectItem value='600'>Semibold</SelectItem>
-                            <SelectItem value='700'>Bold</SelectItem>
-                          </SelectContent>
-                        </Select>
-                        <Label className='text-[10px]'>Alignment</Label>
-                        <Select
-                          value={selectedElement.textAlign || 'center'}
-                          onValueChange={(v) =>
-                            updateElement(selectedId!, {
-                              textAlign: v as 'center' | 'left' | 'right'
-                            })
-                          }
-                        >
-                          <SelectTrigger className='h-8 text-xs'>
-                            <SelectValue />
-                          </SelectTrigger>
-                          <SelectContent>
-                            <SelectItem value='left'>Left</SelectItem>
-                            <SelectItem value='center'>Center</SelectItem>
-                            <SelectItem value='right'>Right</SelectItem>
-                          </SelectContent>
-                        </Select>
-                        <Label className='text-[10px]'>Line Height</Label>
-                        <Input
-                          className='h-8 text-xs'
-                          step='0.1'
-                          type='number'
-                          value={selectedElement.lineHeight || 1.2}
-                          onChange={(e) =>
-                            updateElement(selectedId!, { lineHeight: Number(e.target.value) })
-                          }
-                        />
-                        <Label className='text-[10px]'>Text</Label>
-                        <Input
-                          className='h-8 text-xs'
-                          value={selectedElement.text}
-                          onChange={(e) => updateElement(selectedId!, { text: e.target.value })}
-                        />
-                      </div>
-                    )}
-                  </div>
+                      {selectedElement.type === 'image' && (
+                        <div className='space-y-2 pt-2'>
+                          <Label className='text-[10px]'>Image Fit</Label>
+                          <Select
+                            value={selectedElement.imageFit || 'contain'}
+                            onValueChange={(v) =>
+                              updateElement(selectedId!, {
+                                imageFit: v as 'contain' | 'cover' | 'fill'
+                              })
+                            }
+                          >
+                            <SelectTrigger className='h-8 text-xs'>
+                              <SelectValue />
+                            </SelectTrigger>
+                            <SelectContent>
+                              <SelectItem value='contain'>Contain</SelectItem>
+                              <SelectItem value='cover'>Cover</SelectItem>
+                              <SelectItem value='fill'>Fill</SelectItem>
+                            </SelectContent>
+                          </Select>
+                          <Button
+                            className='w-full'
+                            size='sm'
+                            variant='outline'
+                            onClick={() => openImagePicker('replace', selectedId!)}
+                          >
+                            Replace Image
+                          </Button>
+                        </div>
+                      )}
+                      {selectedElement.type === 'text' && (
+                        <div className='space-y-2 pt-2'>
+                          <Label className='text-[10px]'>Font Size</Label>
+                          <Input
+                            className='h-8 text-xs'
+                            type='number'
+                            value={selectedElement.fontSize}
+                            onChange={(e) =>
+                              updateElement(selectedId!, { fontSize: Number(e.target.value) })
+                            }
+                          />
+                          <Label className='text-[10px]'>Font Family</Label>
+                          <Select
+                            value={
+                              selectedElement.fontFamily ||
+                              'ui-sans-serif, system-ui, -apple-system'
+                            }
+                            onValueChange={(v) => updateElement(selectedId!, { fontFamily: v })}
+                          >
+                            <SelectTrigger className='h-8 text-xs'>
+                              <SelectValue />
+                            </SelectTrigger>
+                            <SelectContent>
+                              <SelectItem value='ui-sans-serif, system-ui, -apple-system'>
+                                Sans
+                              </SelectItem>
+                              <SelectItem value='ui-serif, Georgia, serif'>Serif</SelectItem>
+                              <SelectItem value='ui-monospace, SFMono-Regular, Menlo, monospace'>
+                                Mono
+                              </SelectItem>
+                              <SelectItem value='Arial, Helvetica, sans-serif'>Arial</SelectItem>
+                              <SelectItem value='Georgia, serif'>Georgia</SelectItem>
+                            </SelectContent>
+                          </Select>
+                          <Label className='text-[10px]'>Font Weight</Label>
+                          <Select
+                            value={String(selectedElement.fontWeight || 400)}
+                            onValueChange={(v) =>
+                              updateElement(selectedId!, { fontWeight: Number(v) })
+                            }
+                          >
+                            <SelectTrigger className='h-8 text-xs'>
+                              <SelectValue />
+                            </SelectTrigger>
+                            <SelectContent>
+                              <SelectItem value='300'>Light</SelectItem>
+                              <SelectItem value='400'>Regular</SelectItem>
+                              <SelectItem value='500'>Medium</SelectItem>
+                              <SelectItem value='600'>Semibold</SelectItem>
+                              <SelectItem value='700'>Bold</SelectItem>
+                            </SelectContent>
+                          </Select>
+                          <Label className='text-[10px]'>Alignment</Label>
+                          <Select
+                            value={selectedElement.textAlign || 'center'}
+                            onValueChange={(v) =>
+                              updateElement(selectedId!, {
+                                textAlign: v as 'center' | 'left' | 'right'
+                              })
+                            }
+                          >
+                            <SelectTrigger className='h-8 text-xs'>
+                              <SelectValue />
+                            </SelectTrigger>
+                            <SelectContent>
+                              <SelectItem value='left'>Left</SelectItem>
+                              <SelectItem value='center'>Center</SelectItem>
+                              <SelectItem value='right'>Right</SelectItem>
+                            </SelectContent>
+                          </Select>
+                          <Label className='text-[10px]'>Line Height</Label>
+                          <Input
+                            className='h-8 text-xs'
+                            step='0.1'
+                            type='number'
+                            value={selectedElement.lineHeight || 1.2}
+                            onChange={(e) =>
+                              updateElement(selectedId!, { lineHeight: Number(e.target.value) })
+                            }
+                          />
+                          <Label className='text-[10px]'>Text</Label>
+                          <Input
+                            className='h-8 text-xs'
+                            value={selectedElement.text}
+                            onChange={(e) => updateElement(selectedId!, { text: e.target.value })}
+                          />
+                        </div>
+                      )}
+                    </div>
 
-                  <Separator />
+                    <Separator />
 
-                  <div className='space-y-2 pt-2'>
-                    <Button
-                      className='w-full border-purple-200 text-purple-600 hover:bg-purple-50'
-                      size='sm'
-                      variant='outline'
-                      onClick={createMaster}
-                    >
-                      <ComponentIcon className='mr-2 h-3.5 w-3.5' /> Create Component
-                    </Button>
-                    <Button
-                      className='w-full text-red-500 hover:bg-red-50 hover:text-red-600'
-                      size='sm'
-                      variant='ghost'
-                      onClick={deleteSelected}
-                    >
-                      <Trash2 className='mr-2 h-3.5 w-3.5' /> Delete Layer
-                    </Button>
+                    <div className='space-y-2 pt-2'>
+                      <Button
+                        className='w-full border-purple-200 text-purple-600 hover:bg-purple-50'
+                        size='sm'
+                        variant='outline'
+                        onClick={createMaster}
+                      >
+                        <ComponentIcon className='mr-2 h-3.5 w-3.5' /> Create Component
+                      </Button>
+                      <Button
+                        className='w-full text-red-500 hover:bg-red-50 hover:text-red-600'
+                        size='sm'
+                        variant='ghost'
+                        onClick={deleteSelected}
+                      >
+                        <Trash2 className='mr-2 h-3.5 w-3.5' /> Delete Layer
+                      </Button>
+                    </div>
                   </div>
-                </div>
-              ) : (
-                <div className='flex h-full flex-col items-center justify-center p-8 text-center text-slate-300'>
-                  <Layout className='mb-4 h-12 w-12 opacity-20' />
-                  <p className='text-sm'>Select an element to edit</p>
-                </div>
-              )}
+                ) : (
+                  <div className='flex h-full flex-col items-center justify-center p-8 text-center text-slate-300'>
+                    <Layout className='mb-4 h-12 w-12 opacity-20' />
+                    <p className='text-sm'>Select an element to edit</p>
+                  </div>
+                )}
+              </ScrollArea>
             </TabsContent>
           </Tabs>
         </aside>
