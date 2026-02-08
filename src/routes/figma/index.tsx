@@ -6,6 +6,7 @@ import {
   Component as ComponentIcon,
   Copy,
   Download,
+  Image as ImageIcon,
   Layout,
   Maximize,
   Minus,
@@ -43,7 +44,7 @@ interface Constraints {
   vertical: VerticalConstraint;
 }
 
-type ElementType = 'circle' | 'frame' | 'instance' | 'rect' | 'text';
+type ElementType = 'circle' | 'frame' | 'image' | 'instance' | 'rect' | 'text';
 
 interface Element {
   children?: Element[];
@@ -54,6 +55,8 @@ interface Element {
   fontWeight?: number;
   height: number;
   id: string;
+  imageFit?: 'contain' | 'cover' | 'fill';
+  imageSrc?: string;
   lineHeight?: number;
   masterId?: string;
   name: string;
@@ -468,6 +471,9 @@ const FigmaLite = () => {
   const [isDragging, setIsDragging] = useState(false);
 
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const imageInputRef = useRef<HTMLInputElement>(null);
+  const imageTargetRef = useRef<{ mode: 'new' | 'replace'; id?: string }>({ mode: 'new' });
+  const imageCacheRef = useRef<Map<string, HTMLImageElement>>(new Map());
   const dragRef = useRef<{
     id?: string;
     isPanning?: boolean;
@@ -536,6 +542,100 @@ const FigmaLite = () => {
       setSelectedId(null);
     }
   };
+
+  const openImagePicker = useCallback((mode: 'new' | 'replace', id?: string) => {
+    imageTargetRef.current = { mode, id };
+    imageInputRef.current?.click();
+  }, []);
+
+  const addImageElement = useCallback(
+    (file: File, src: string) => {
+      const img = new window.Image();
+      img.onload = () => {
+        const naturalW = img.naturalWidth || 1;
+        const naturalH = img.naturalHeight || 1;
+        let width = naturalW;
+        let height = naturalH;
+        const maxSize = 320;
+        const scale = Math.min(1, maxSize / Math.max(width, height));
+        width *= scale;
+        height *= scale;
+
+        let parentFrame: Element | null = null;
+        if (selectedElement?.type === 'frame') {
+          parentFrame = selectedElement;
+        } else if (selectedId) {
+          const parent = findParentElement(elements, selectedId);
+          if (parent?.type === 'frame') parentFrame = parent;
+        }
+        if (parentFrame) {
+          width = parentFrame.width;
+          height = parentFrame.height;
+        }
+
+        const newEl: Element = {
+          id: generateId(),
+          name: file.name || 'Image',
+          type: 'image',
+          x: parentFrame ? 0 : 100,
+          y: parentFrame ? 0 : 100,
+          width,
+          height,
+          fill: '#ffffff',
+          stroke: '#94a3b8',
+          strokeWidth: 0,
+          opacity: 1,
+          constraints: { horizontal: 'left', vertical: 'top' },
+          imageSrc: src,
+          imageFit: parentFrame ? 'cover' : 'contain'
+        };
+
+        if (parentFrame) {
+          setElements((prev) =>
+            updateElementInList(prev, parentFrame.id, {
+              children: [...(parentFrame.children || []), newEl]
+            })
+          );
+        } else {
+          setElements((prev) => [...prev, newEl]);
+        }
+
+        imageCacheRef.current.set(src, img);
+        setSelectedId(newEl.id);
+      };
+      img.src = src;
+    },
+    [elements, selectedElement, selectedId]
+  );
+
+  const handleImageInputChange = useCallback(
+    (e: React.ChangeEvent<HTMLInputElement>) => {
+      const file = e.target.files?.[0];
+      if (!file) return;
+      const target = imageTargetRef.current;
+
+      const reader = new FileReader();
+      reader.onload = () => {
+        const src = typeof reader.result === 'string' ? reader.result : '';
+        if (!src) return;
+
+        if (target.mode === 'replace' && target.id) {
+          updateElement(target.id, { imageSrc: src });
+          const img = new window.Image();
+          img.onload = () => {
+            imageCacheRef.current.set(src, img);
+          };
+          img.src = src;
+          return;
+        }
+
+        addImageElement(file, src);
+      };
+      reader.readAsDataURL(file);
+      e.target.value = '';
+    },
+    [addImageElement, updateElement]
+  );
 
   const zoomAtPoint = useCallback(
     (nextZoom: number, clientX: number, clientY: number) => {
@@ -829,6 +929,13 @@ const FigmaLite = () => {
         content = `<rect x="${el.x}" y="${el.y}" width="${el.width}" height="${el.height}" fill="${el.fill}" stroke="${el.stroke}" stroke-width="${el.strokeWidth}" fill-opacity="${el.opacity}" />`;
       } else if (el.type === 'circle') {
         content = `<circle cx="${el.x + el.width / 2}" cy="${el.y + el.height / 2}" r="${el.width / 2}" fill="${el.fill}" stroke="${el.stroke}" stroke-width="${el.strokeWidth}" fill-opacity="${el.opacity}" />`;
+      } else if (el.type === 'image') {
+        if (el.imageSrc) {
+          const fit = el.imageFit || 'contain';
+          const preserve =
+            fit === 'fill' ? 'none' : fit === 'cover' ? 'xMidYMid slice' : 'xMidYMid meet';
+          content = `<image href="${el.imageSrc}" x="${el.x}" y="${el.y}" width="${el.width}" height="${el.height}" preserveAspectRatio="${preserve}" opacity="${el.opacity}" />`;
+        }
       } else if (el.type === 'text') {
         const fontSize = el.fontSize || 16;
         const fontFamily = el.fontFamily || 'ui-sans-serif, system-ui, -apple-system';
@@ -953,6 +1060,55 @@ const FigmaLite = () => {
           ctx.strokeStyle = el.stroke;
           ctx.lineWidth = el.strokeWidth;
           ctx.stroke();
+        }
+      } else if (el.type === 'image') {
+        ctx.save();
+        ctx.beginPath();
+        ctx.rect(x, y, el.width, el.height);
+        ctx.clip();
+
+        const src = el.imageSrc;
+        if (src) {
+          let image = imageCacheRef.current.get(src);
+          if (!image) {
+            image = new window.Image();
+            image.onload = () => {
+              imageCacheRef.current.set(src, image!);
+              drawScene();
+            };
+            image.src = src;
+            imageCacheRef.current.set(src, image);
+          }
+
+          if (image.complete && image.naturalWidth > 0) {
+            const fit = el.imageFit || 'contain';
+            if (fit === 'fill') {
+              ctx.drawImage(image, x, y, el.width, el.height);
+            } else {
+              const scale =
+                fit === 'cover'
+                  ? Math.max(el.width / image.naturalWidth, el.height / image.naturalHeight)
+                  : Math.min(el.width / image.naturalWidth, el.height / image.naturalHeight);
+              const drawW = image.naturalWidth * scale;
+              const drawH = image.naturalHeight * scale;
+              const drawX = x + (el.width - drawW) / 2;
+              const drawY = y + (el.height - drawH) / 2;
+              ctx.drawImage(image, drawX, drawY, drawW, drawH);
+            }
+          } else {
+            ctx.fillStyle = '#e2e8f0';
+            ctx.fillRect(x, y, el.width, el.height);
+          }
+        } else {
+          ctx.fillStyle = '#e2e8f0';
+          ctx.fillRect(x, y, el.width, el.height);
+        }
+        ctx.restore();
+
+        if (el.strokeWidth > 0 && el.stroke) {
+          ctx.strokeStyle = el.stroke;
+          ctx.lineWidth = el.strokeWidth;
+          ctx.strokeRect(x, y, el.width, el.height);
         }
       } else if (el.type === 'text') {
         const fontSize = el.fontSize || 16;
@@ -1177,6 +1333,7 @@ const FigmaLite = () => {
           {el.type === 'frame' && <Monitor className='h-3 w-3' />}
           {el.type === 'rect' && <Square className='h-3 w-3' />}
           {el.type === 'circle' && <Circle className='h-3 w-3' />}
+          {el.type === 'image' && <ImageIcon className='h-3 w-3' />}
           {el.type === 'text' && <Type className='h-3 w-3' />}
           {el.type === 'instance' && <ComponentIcon className='h-3 w-3 text-purple-500' />}
           <span className='truncate'>{el.name}</span>
@@ -1191,6 +1348,13 @@ const FigmaLite = () => {
     <div className='flex h-screen flex-col overflow-hidden bg-slate-50 font-sans text-slate-900'>
       {/* Toolbar */}
       <header className='z-20 flex h-12 shrink-0 items-center justify-between border-b bg-white px-4 shadow-sm'>
+        <input
+          ref={imageInputRef}
+          accept='image/*'
+          className='hidden'
+          type='file'
+          onChange={handleImageInputChange}
+        />
         <div className='flex items-center gap-4'>
           <div className='flex items-center gap-1 rounded-lg bg-slate-100 p-1'>
             <Button
@@ -1225,6 +1389,14 @@ const FigmaLite = () => {
               onClick={() => addElement('circle')}
             >
               <Circle className='h-4 w-4' />
+            </Button>
+            <Button
+              className='h-8 w-8'
+              size='icon'
+              variant='ghost'
+              onClick={() => openImagePicker('new')}
+            >
+              <ImageIcon className='h-4 w-4' />
             </Button>
             <Button
               className='h-8 w-8'
@@ -1471,6 +1643,36 @@ const FigmaLite = () => {
                         {Math.round(selectedElement.opacity * 100)}%
                       </div>
                     </div>
+                    {selectedElement.type === 'image' && (
+                      <div className='space-y-2 pt-2'>
+                        <Label className='text-[10px]'>Image Fit</Label>
+                        <Select
+                          value={selectedElement.imageFit || 'contain'}
+                          onValueChange={(v) =>
+                            updateElement(selectedId!, {
+                              imageFit: v as 'contain' | 'cover' | 'fill'
+                            })
+                          }
+                        >
+                          <SelectTrigger className='h-8 text-xs'>
+                            <SelectValue />
+                          </SelectTrigger>
+                          <SelectContent>
+                            <SelectItem value='contain'>Contain</SelectItem>
+                            <SelectItem value='cover'>Cover</SelectItem>
+                            <SelectItem value='fill'>Fill</SelectItem>
+                          </SelectContent>
+                        </Select>
+                        <Button
+                          className='w-full'
+                          size='sm'
+                          variant='outline'
+                          onClick={() => openImagePicker('replace', selectedId!)}
+                        >
+                          Replace Image
+                        </Button>
+                      </div>
+                    )}
                     {selectedElement.type === 'text' && (
                       <div className='space-y-2 pt-2'>
                         <Label className='text-[10px]'>Font Size</Label>
