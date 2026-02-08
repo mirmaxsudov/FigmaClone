@@ -1,0 +1,10 @@
+node_modules
+dist
+.env
+.tanstack
+.idea
+.vite
+tsconfig.tsbuildinfo
+src/utils/i18n/locales
+*~
+.DS_Store
