@@ -1,4 +1,4 @@
-import { createFileRoute } from '@tanstack/react-router';
+import { createFileRoute, Link } from '@tanstack/react-router';
 import {
   ChevronDownIcon,
   ChevronRightIcon,
@@ -45,6 +45,7 @@ interface Constraints {
 }
 
 type ElementType = 'circle' | 'frame' | 'image' | 'instance' | 'rect' | 'text';
+type ResizeHandle = 'e' | 'n' | 'ne' | 'nw' | 's' | 'se' | 'sw' | 'w';
 
 interface Element {
   children?: Element[];
@@ -73,12 +74,39 @@ interface Element {
 
 const generateId = () => Math.random().toString(36).substring(2, 9);
 const clampZoom = (value: number) => Math.min(5, Math.max(0.1, value));
+const GRID_SIZE = 24;
+const HANDLE_SIZE = 8;
 const escapeXML = (value: string) =>
   value.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+const cursorForHandle = (handle: ResizeHandle) => {
+  switch (handle) {
+    case 'nw':
+    case 'se':
+      return 'nwse-resize';
+    case 'ne':
+    case 'sw':
+      return 'nesw-resize';
+    case 'n':
+    case 's':
+      return 'ns-resize';
+    case 'e':
+    case 'w':
+      return 'ew-resize';
+    default:
+      return 'default';
+  }
+};
 
 interface DuplicateResult {
   duplicated: Element | null;
   elements: Element[];
+}
+
+interface ElementBounds {
+  height: number;
+  width: number;
+  x: number;
+  y: number;
 }
 
 const findElementById = (elements: Element[], id: string): Element | null => {
@@ -86,6 +114,26 @@ const findElementById = (elements: Element[], id: string): Element | null => {
     if (el.id === id) return el;
     if (el.children) {
       const found = findElementById(el.children, id);
+      if (found) return found;
+    }
+  }
+  return null;
+};
+
+const findElementBounds = (
+  elements: Element[],
+  id: string,
+  offsetX = 0,
+  offsetY = 0
+): ElementBounds | null => {
+  for (const el of elements) {
+    const x = offsetX + el.x;
+    const y = offsetY + el.y;
+    if (el.id === id) {
+      return { x, y, width: el.width, height: el.height };
+    }
+    if (el.children) {
+      const found = findElementBounds(el.children, id, x, y);
       if (found) return found;
     }
   }
@@ -469,19 +517,45 @@ const FigmaLite = () => {
   const [pan, setPan] = useState({ x: 0, y: 0 });
   const [tool, setTool] = useState<'select' | ElementType>('select');
   const [isDragging, setIsDragging] = useState(false);
+  const [hoverHandle, setHoverHandle] = useState<ResizeHandle | null>(null);
+  const [activeHandle, setActiveHandle] = useState<ResizeHandle | null>(null);
 
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const imageInputRef = useRef<HTMLInputElement>(null);
   const imageTargetRef = useRef<{ mode: 'new' | 'replace'; id?: string }>({ mode: 'new' });
   const imageCacheRef = useRef<Map<string, HTMLImageElement>>(new Map());
-  const dragRef = useRef<{
-    id?: string;
-    isPanning?: boolean;
-    startX: number;
-    startY: number;
-    elX: number;
-    elY: number;
-  } | null>(null);
+  const rafRef = useRef<number | null>(null);
+  const pendingUpdateRef = useRef<{ id: string; updates: Partial<Element> } | null>(null);
+  const dragRef = useRef<
+    | {
+        mode: 'move';
+        id: string;
+        startX: number;
+        startY: number;
+        elX: number;
+        elY: number;
+      }
+    | {
+        mode: 'pan';
+        startX: number;
+        startY: number;
+        elX: number;
+        elY: number;
+      }
+    | {
+        mode: 'resize';
+        id: string;
+        handle: ResizeHandle;
+        startX: number;
+        startY: number;
+        elX: number;
+        elY: number;
+        elW: number;
+        elH: number;
+        aspect: number;
+      }
+    | null
+  >(null);
 
   const selectedElement = useMemo(
     () => (selectedId ? findElementById(elements, selectedId) || masters[selectedId] : null),
@@ -542,6 +616,21 @@ const FigmaLite = () => {
       setSelectedId(null);
     }
   };
+
+  const scheduleElementUpdate = useCallback(
+    (id: string, updates: Partial<Element>) => {
+      pendingUpdateRef.current = { id, updates };
+      if (rafRef.current !== null) return;
+      rafRef.current = window.requestAnimationFrame(() => {
+        const pending = pendingUpdateRef.current;
+        rafRef.current = null;
+        if (pending) {
+          updateElement(pending.id, pending.updates);
+        }
+      });
+    },
+    [updateElement]
+  );
 
   const openImagePicker = useCallback((mode: 'new' | 'replace', id?: string) => {
     imageTargetRef.current = { mode, id };
@@ -825,15 +914,74 @@ const FigmaLite = () => {
     [elements]
   );
 
+  const getResizeHandleAtPoint = useCallback(
+    (point: { x: number; y: number }) => {
+      if (!selectedId || !selectedElement) return null;
+      const bounds = findElementBounds(elements, selectedId);
+      if (!bounds) return null;
+
+      const size = HANDLE_SIZE / zoom;
+      const half = size / 2;
+      const handles: Record<ResizeHandle, { x: number; y: number }> = {
+        nw: { x: bounds.x, y: bounds.y },
+        n: { x: bounds.x + bounds.width / 2, y: bounds.y },
+        ne: { x: bounds.x + bounds.width, y: bounds.y },
+        e: { x: bounds.x + bounds.width, y: bounds.y + bounds.height / 2 },
+        se: { x: bounds.x + bounds.width, y: bounds.y + bounds.height },
+        s: { x: bounds.x + bounds.width / 2, y: bounds.y + bounds.height },
+        sw: { x: bounds.x, y: bounds.y + bounds.height },
+        w: { x: bounds.x, y: bounds.y + bounds.height / 2 }
+      };
+
+      for (const [handle, pos] of Object.entries(handles) as [
+        ResizeHandle,
+        { x: number; y: number }
+      ][]) {
+        if (
+          point.x >= pos.x - half &&
+          point.x <= pos.x + half &&
+          point.y >= pos.y - half &&
+          point.y <= pos.y + half
+        ) {
+          return handle;
+        }
+      }
+      return null;
+    },
+    [elements, selectedElement, selectedId, zoom]
+  );
+
   const handlePointerDown = (e: React.PointerEvent<HTMLCanvasElement>) => {
     e.stopPropagation();
     const point = getCanvasPoint(e);
+    const resizeHandle = getResizeHandleAtPoint(point);
+    if (resizeHandle && selectedId && selectedElement) {
+      setIsDragging(true);
+      setActiveHandle(resizeHandle);
+      dragRef.current = {
+        mode: 'resize',
+        id: selectedId,
+        handle: resizeHandle,
+        startX: e.clientX,
+        startY: e.clientY,
+        elX: selectedElement.x,
+        elY: selectedElement.y,
+        elW: selectedElement.width,
+        elH: selectedElement.height,
+        aspect: selectedElement.width / Math.max(1, selectedElement.height)
+      };
+      (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+      return;
+    }
+
     const hit = hitTestElements(point);
 
     if (hit) {
       setSelectedId(hit.id);
       setIsDragging(true);
+      setActiveHandle(null);
       dragRef.current = {
+        mode: 'move',
         id: hit.id,
         startX: e.clientX,
         startY: e.clientY,
@@ -843,8 +991,9 @@ const FigmaLite = () => {
     } else {
       setSelectedId(null);
       setIsDragging(true);
+      setActiveHandle(null);
       dragRef.current = {
-        isPanning: true,
+        mode: 'pan',
         startX: e.clientX,
         startY: e.clientY,
         elX: pan.x,
@@ -855,24 +1004,147 @@ const FigmaLite = () => {
   };
 
   const handlePointerMove = (e: React.PointerEvent<HTMLCanvasElement>) => {
-    if (!dragRef.current) return;
-    const { id, isPanning, startX, startY, elX, elY } = dragRef.current;
+    const point = getCanvasPoint(e);
+    if (!dragRef.current) {
+      const nextHandle = getResizeHandleAtPoint(point);
+      setHoverHandle((prev) => (prev === nextHandle ? prev : nextHandle));
+      return;
+    }
+    const state = dragRef.current;
+    const dx = (e.clientX - state.startX) / zoom;
+    const dy = (e.clientY - state.startY) / zoom;
 
-    if (isPanning) {
-      const dx = e.clientX - startX;
-      const dy = e.clientY - startY;
-      setPan({ x: elX + dx, y: elY + dy });
-    } else if (id) {
-      const dx = (e.clientX - startX) / zoom;
-      const dy = (e.clientY - startY) / zoom;
-      updateElement(id, { x: elX + dx, y: elY + dy });
+    if (state.mode === 'pan') {
+      setPan({ x: state.elX + e.clientX - state.startX, y: state.elY + e.clientY - state.startY });
+      return;
+    }
+
+    if (state.mode === 'move') {
+      scheduleElementUpdate(state.id, { x: state.elX + dx, y: state.elY + dy });
+      return;
+    }
+
+    if (state.mode === 'resize') {
+      const moveLeft = state.handle.includes('w');
+      const moveRight = state.handle.includes('e');
+      const moveTop = state.handle.includes('n');
+      const moveBottom = state.handle.includes('s');
+
+      let left = state.elX;
+      let right = state.elX + state.elW;
+      let top = state.elY;
+      let bottom = state.elY + state.elH;
+
+      if (moveLeft) left += dx;
+      if (moveRight) right += dx;
+      if (moveTop) top += dy;
+      if (moveBottom) bottom += dy;
+
+      const snap = (value: number) => Math.round(value / GRID_SIZE) * GRID_SIZE;
+      const minSize = 16;
+      const aspect = state.aspect || 1;
+
+      const bounds = findElementBounds(elements, state.id);
+      const offsetX = bounds ? bounds.x - state.elX : 0;
+      const offsetY = bounds ? bounds.y - state.elY : 0;
+
+      let width = right - left;
+      let height = bottom - top;
+
+      if (e.shiftKey) {
+        let primary: 'height' | 'width';
+        if ((moveLeft || moveRight) && !(moveTop || moveBottom)) {
+          primary = 'width';
+        } else if ((moveTop || moveBottom) && !(moveLeft || moveRight)) {
+          primary = 'height';
+        } else {
+          primary = Math.abs(dx) >= Math.abs(dy) ? 'width' : 'height';
+        }
+
+        if (primary === 'width') {
+          if (moveLeft && !moveRight) {
+            left = snap(left + offsetX) - offsetX;
+          } else if (moveRight && !moveLeft) {
+            right = snap(right + offsetX) - offsetX;
+          }
+          width = Math.max(minSize, right - left);
+          height = Math.max(minSize, width / aspect);
+        } else {
+          if (moveTop && !moveBottom) {
+            top = snap(top + offsetY) - offsetY;
+          } else if (moveBottom && !moveTop) {
+            bottom = snap(bottom + offsetY) - offsetY;
+          }
+          height = Math.max(minSize, bottom - top);
+          width = Math.max(minSize, height * aspect);
+        }
+
+        if (moveLeft && !moveRight) {
+          left = right - width;
+        } else if (moveRight && !moveLeft) {
+          right = left + width;
+        } else {
+          const centerX = state.elX + state.elW / 2;
+          left = centerX - width / 2;
+          right = centerX + width / 2;
+        }
+
+        if (moveTop && !moveBottom) {
+          top = bottom - height;
+        } else if (moveBottom && !moveTop) {
+          bottom = top + height;
+        } else {
+          const centerY = state.elY + state.elH / 2;
+          top = centerY - height / 2;
+          bottom = centerY + height / 2;
+        }
+      } else {
+        if (moveLeft) left = snap(left + offsetX) - offsetX;
+        if (moveRight) right = snap(right + offsetX) - offsetX;
+        if (moveTop) top = snap(top + offsetY) - offsetY;
+        if (moveBottom) bottom = snap(bottom + offsetY) - offsetY;
+
+        width = right - left;
+        height = bottom - top;
+
+        if (width < minSize) {
+          width = minSize;
+          if (moveLeft && !moveRight) {
+            left = right - width;
+          } else {
+            right = left + width;
+          }
+        }
+
+        if (height < minSize) {
+          height = minSize;
+          if (moveTop && !moveBottom) {
+            top = bottom - height;
+          } else {
+            bottom = top + height;
+          }
+        }
+      }
+
+      scheduleElementUpdate(state.id, { x: left, y: top, width, height });
     }
   };
 
   const handlePointerUp = () => {
     dragRef.current = null;
     setIsDragging(false);
+    setActiveHandle(null);
+    setHoverHandle(null);
   };
+
+  useEffect(() => {
+    return () => {
+      if (rafRef.current !== null) {
+        window.cancelAnimationFrame(rafRef.current);
+        rafRef.current = null;
+      }
+    };
+  }, []);
 
   const handleWheel = (e: React.WheelEvent<HTMLCanvasElement>) => {
     e.preventDefault();
@@ -1005,7 +1277,7 @@ const FigmaLite = () => {
     ctx.fillStyle = '#e5e5e5';
     ctx.fillRect(0, 0, width, height);
 
-    const gridSize = 24;
+    const gridSize = GRID_SIZE;
     const left = -pan.x / zoom;
     const top = -pan.y / zoom;
     const right = (width - pan.x) / zoom;
@@ -1171,8 +1443,27 @@ const FigmaLite = () => {
       if (isSelected) {
         ctx.save();
         ctx.strokeStyle = '#3b82f6';
-        ctx.lineWidth = 2;
+        ctx.lineWidth = 2 / zoom;
         ctx.strokeRect(x - 1, y - 1, el.width + 2, el.height + 2);
+        const handleSize = HANDLE_SIZE / zoom;
+        const half = handleSize / 2;
+        const handles: Array<{ x: number; y: number }> = [
+          { x, y },
+          { x: x + el.width / 2, y },
+          { x: x + el.width, y },
+          { x: x + el.width, y: y + el.height / 2 },
+          { x: x + el.width, y: y + el.height },
+          { x: x + el.width / 2, y: y + el.height },
+          { x, y: y + el.height },
+          { x, y: y + el.height / 2 }
+        ];
+        ctx.fillStyle = '#ffffff';
+        ctx.strokeStyle = '#3b82f6';
+        ctx.lineWidth = 1 / zoom;
+        for (const handle of handles) {
+          ctx.fillRect(handle.x - half, handle.y - half, handleSize, handleSize);
+          ctx.strokeRect(handle.x - half, handle.y - half, handleSize, handleSize);
+        }
         ctx.restore();
       }
     };
@@ -1356,6 +1647,12 @@ const FigmaLite = () => {
           onChange={handleImageInputChange}
         />
         <div className='flex items-center gap-4'>
+          <Link className='mr-2 flex items-center gap-2 transition-opacity hover:opacity-80' to='/'>
+            <div className='flex h-7 w-7 items-center justify-center rounded bg-purple-600 text-white'>
+              <MousePointer2 className='h-4 w-4' />
+            </div>
+            <span className='hidden text-sm font-bold sm:block'>Mockdock</span>
+          </Link>
           <div className='flex items-center gap-1 rounded-lg bg-slate-100 p-1'>
             <Button
               className='h-8 w-8'
@@ -1488,10 +1785,16 @@ const FigmaLite = () => {
         </aside>
         <canvas
           ref={canvasRef}
-          className={cn(
-            'relative w-[130vh] flex-1 touch-none bg-[#e5e5e5]',
-            isDragging ? 'cursor-grabbing' : 'cursor-grab'
-          )}
+          className='relative w-[130vh] flex-1 touch-none bg-[#e5e5e5]'
+          style={{
+            cursor: activeHandle
+              ? cursorForHandle(activeHandle)
+              : hoverHandle
+                ? cursorForHandle(hoverHandle)
+                : isDragging
+                  ? 'grabbing'
+                  : 'grab'
+          }}
           onPointerCancel={handlePointerUp}
           onPointerDown={handlePointerDown}
           onPointerLeave={handlePointerUp}
