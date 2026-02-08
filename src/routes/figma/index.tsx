@@ -1,7 +1,7 @@
 import { createFileRoute } from '@tanstack/react-router';
 import {
-  ChevronDown,
-  ChevronRight,
+  ChevronDownIcon,
+  ChevronRightIcon,
   Circle,
   Component as ComponentIcon,
   Copy,
@@ -49,15 +49,19 @@ interface Element {
   children?: Element[];
   constraints: Constraints;
   fill: string;
+  fontFamily?: string;
   fontSize?: number;
+  fontWeight?: number;
   height: number;
   id: string;
+  lineHeight?: number;
   masterId?: string;
   name: string;
   opacity: number;
   stroke: string;
   strokeWidth: number;
   text?: string;
+  textAlign?: 'center' | 'left' | 'right';
   type: ElementType;
   width: number;
   x: number;
@@ -65,6 +69,14 @@ interface Element {
 }
 
 const generateId = () => Math.random().toString(36).substring(2, 9);
+const clampZoom = (value: number) => Math.min(5, Math.max(0.1, value));
+const escapeXML = (value: string) =>
+  value.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
+interface DuplicateResult {
+  duplicated: Element | null;
+  elements: Element[];
+}
 
 const findElementById = (elements: Element[], id: string): Element | null => {
   for (const el of elements) {
@@ -76,6 +88,28 @@ const findElementById = (elements: Element[], id: string): Element | null => {
   }
   return null;
 };
+
+const findParentElement = (
+  elements: Element[],
+  id: string,
+  parent: Element | null = null
+): Element | null => {
+  for (const el of elements) {
+    if (el.id === id) return parent;
+    if (el.children) {
+      const found = findParentElement(el.children, id, el);
+      if (found) return found;
+    }
+  }
+  return null;
+};
+
+const cloneElement = (el: Element, rename = false): Element => ({
+  ...el,
+  id: generateId(),
+  name: rename ? `${el.name} Copy` : el.name,
+  children: el.children ? el.children.map((child) => cloneElement(child)) : undefined
+});
 
 const updateElementInList = (
   elements: Element[],
@@ -466,7 +500,11 @@ const FigmaLite = () => {
       constraints: { horizontal: 'left', vertical: 'top' },
       children: type === 'frame' ? [] : undefined,
       text: type === 'text' ? 'New Text' : undefined,
-      fontSize: type === 'text' ? 16 : undefined
+      fontSize: type === 'text' ? 16 : undefined,
+      fontFamily: type === 'text' ? 'ui-sans-serif, system-ui, -apple-system' : undefined,
+      fontWeight: type === 'text' ? 400 : undefined,
+      textAlign: type === 'text' ? 'center' : undefined,
+      lineHeight: type === 'text' ? 1.2 : undefined
     };
 
     if (parentFrame) {
@@ -498,6 +536,146 @@ const FigmaLite = () => {
       setSelectedId(null);
     }
   };
+
+  const zoomAtPoint = useCallback(
+    (nextZoom: number, clientX: number, clientY: number) => {
+      const canvas = canvasRef.current;
+      if (!canvas) {
+        setZoom(nextZoom);
+        return;
+      }
+      const rect = canvas.getBoundingClientRect();
+      const mouseX = clientX - rect.left;
+      const mouseY = clientY - rect.top;
+
+      const worldX = (mouseX - pan.x) / zoom;
+      const worldY = (mouseY - pan.y) / zoom;
+
+      const nextPanX = mouseX - worldX * nextZoom;
+      const nextPanY = mouseY - worldY * nextZoom;
+
+      setZoom(nextZoom);
+      setPan({ x: nextPanX, y: nextPanY });
+    },
+    [pan.x, pan.y, zoom]
+  );
+
+  const zoomToCenter = useCallback(
+    (nextZoom: number) => {
+      const canvas = canvasRef.current;
+      if (!canvas) {
+        setZoom(nextZoom);
+        return;
+      }
+      const rect = canvas.getBoundingClientRect();
+      zoomAtPoint(nextZoom, rect.left + rect.width / 2, rect.top + rect.height / 2);
+    },
+    [zoomAtPoint]
+  );
+
+  const duplicateElementInList = useCallback((list: Element[], id: string): DuplicateResult => {
+    let duplicated: Element | null = null;
+    const next: Element[] = [];
+
+    for (const el of list) {
+      if (el.id === id) {
+        const clone = cloneElement(el, true);
+        clone.x += 20;
+        clone.y += 20;
+        duplicated = clone;
+        next.push(el, clone);
+        continue;
+      }
+
+      if (el.children) {
+        const result: DuplicateResult = duplicateElementInList(el.children, id);
+        if (result.duplicated) {
+          duplicated = result.duplicated;
+          next.push({ ...el, children: result.elements });
+          continue;
+        }
+      }
+
+      next.push(el);
+    }
+
+    return { elements: next, duplicated };
+  }, []);
+
+  const duplicateSelected = useCallback(() => {
+    if (!selectedId || !selectedElement) return;
+
+    if (masters[selectedId]) {
+      const clone = cloneElement(masters[selectedId], true);
+      setMasters((prev) => ({ ...prev, [clone.id]: clone }));
+      setSelectedId(clone.id);
+      return;
+    }
+
+    const result = duplicateElementInList(elements, selectedId);
+    if (result.duplicated) {
+      setElements(result.elements);
+      setSelectedId(result.duplicated.id);
+    }
+  }, [duplicateElementInList, elements, masters, selectedElement, selectedId]);
+
+  const nudgeSelected = useCallback(
+    (dx: number, dy: number) => {
+      if (!selectedId || !selectedElement) return;
+      updateElement(selectedId, { x: selectedElement.x + dx, y: selectedElement.y + dy });
+    },
+    [selectedElement, selectedId, updateElement]
+  );
+
+  const alignSelected = useCallback(
+    (mode: 'bottom' | 'centerX' | 'centerY' | 'left' | 'right' | 'top') => {
+      if (!selectedId || !selectedElement) return;
+
+      const parent = findParentElement(elements, selectedId);
+      let bounds: { x: number; y: number; width: number; height: number } | null = null;
+
+      if (parent) {
+        bounds = { x: 0, y: 0, width: parent.width, height: parent.height };
+      } else {
+        const canvas = canvasRef.current;
+        if (!canvas) return;
+        const rect = canvas.getBoundingClientRect();
+        bounds = {
+          x: -pan.x / zoom,
+          y: -pan.y / zoom,
+          width: rect.width / zoom,
+          height: rect.height / zoom
+        };
+      }
+
+      let nextX = selectedElement.x;
+      let nextY = selectedElement.y;
+
+      switch (mode) {
+        case 'left':
+          nextX = bounds.x;
+          break;
+        case 'right':
+          nextX = bounds.x + bounds.width - selectedElement.width;
+          break;
+        case 'centerX':
+          nextX = bounds.x + (bounds.width - selectedElement.width) / 2;
+          break;
+        case 'top':
+          nextY = bounds.y;
+          break;
+        case 'bottom':
+          nextY = bounds.y + bounds.height - selectedElement.height;
+          break;
+        case 'centerY':
+          nextY = bounds.y + (bounds.height - selectedElement.height) / 2;
+          break;
+      }
+
+      updateElement(selectedId, { x: nextX, y: nextY });
+    },
+    [elements, pan.x, pan.y, selectedElement, selectedId, updateElement, zoom]
+  );
 
   const getCanvasPoint = useCallback(
     (e: React.PointerEvent<HTMLCanvasElement>) => {
@@ -598,25 +776,11 @@ const FigmaLite = () => {
 
   const handleWheel = (e: React.WheelEvent<HTMLCanvasElement>) => {
     e.preventDefault();
-    const canvas = canvasRef.current;
-    if (!canvas) return;
-    const rect = canvas.getBoundingClientRect();
-    const mouseX = e.clientX - rect.left;
-    const mouseY = e.clientY - rect.top;
-
-    const worldX = (mouseX - pan.x) / zoom;
-    const worldY = (mouseY - pan.y) / zoom;
-
     const isPinch = e.ctrlKey || e.metaKey;
     const zoomIntensity = isPinch ? 0.003 : 0.002;
     const zoomFactor = Math.exp(-e.deltaY * zoomIntensity);
-    const nextZoom = Math.min(5, Math.max(0.1, zoom * zoomFactor));
-
-    const nextPanX = mouseX - worldX * nextZoom;
-    const nextPanY = mouseY - worldY * nextZoom;
-
-    setZoom(nextZoom);
-    setPan({ x: nextPanX, y: nextPanY });
+    const nextZoom = clampZoom(zoom * zoomFactor);
+    zoomAtPoint(nextZoom, e.clientX, e.clientY);
   };
 
   const createMaster = () => {
@@ -666,7 +830,25 @@ const FigmaLite = () => {
       } else if (el.type === 'circle') {
         content = `<circle cx="${el.x + el.width / 2}" cy="${el.y + el.height / 2}" r="${el.width / 2}" fill="${el.fill}" stroke="${el.stroke}" stroke-width="${el.strokeWidth}" fill-opacity="${el.opacity}" />`;
       } else if (el.type === 'text') {
-        content = `<text x="${el.x}" y="${el.y + (el.fontSize || 16)}" fill="${el.fill}" font-size="${el.fontSize}">${el.text}</text>`;
+        const fontSize = el.fontSize || 16;
+        const fontFamily = el.fontFamily || 'ui-sans-serif, system-ui, -apple-system';
+        const fontWeight = el.fontWeight || 400;
+        const align = el.textAlign || 'center';
+        const anchor = align === 'left' ? 'start' : align === 'right' ? 'end' : 'middle';
+        const lineHeight = (el.lineHeight || 1.2) * fontSize;
+        const lines = (el.text || '').split('\n');
+        const textX =
+          align === 'left' ? el.x : align === 'right' ? el.x + el.width : el.x + el.width / 2;
+        const startY = el.y + el.height / 2 - (lineHeight * (lines.length - 1)) / 2;
+
+        const tspans = lines
+          .map((line, index) => {
+            const dy = index === 0 ? 0 : lineHeight;
+            return `<tspan x="${textX}" dy="${dy}">${escapeXML(line)}</tspan>`;
+          })
+          .join('');
+
+        content = `<text x="${textX}" y="${startY}" fill="${el.fill}" font-size="${fontSize}" font-family="${fontFamily}" font-weight="${fontWeight}" text-anchor="${anchor}" dominant-baseline="middle">${tspans}</text>`;
       }
 
       if (el.children) {
@@ -773,11 +955,25 @@ const FigmaLite = () => {
           ctx.stroke();
         }
       } else if (el.type === 'text') {
+        const fontSize = el.fontSize || 16;
+        const fontFamily = el.fontFamily || 'ui-sans-serif, system-ui, -apple-system';
+        const fontWeight = el.fontWeight || 400;
+        const align = el.textAlign || 'center';
+        const lineHeight = (el.lineHeight || 1.2) * fontSize;
+        const lines = (el.text || '').split('\n');
+
         ctx.fillStyle = el.fill || '#000000';
-        ctx.font = `${el.fontSize || 16}px ui-sans-serif, system-ui, -apple-system`;
-        ctx.textAlign = 'center';
+        ctx.font = `${fontWeight} ${fontSize}px ${fontFamily}`;
+        ctx.textAlign = align;
         ctx.textBaseline = 'middle';
-        ctx.fillText(el.text || '', x + el.width / 2, y + el.height / 2);
+
+        const textX = align === 'left' ? x : align === 'right' ? x + el.width : x + el.width / 2;
+        const totalHeight = lineHeight * lines.length;
+        const startY = y + el.height / 2 - totalHeight / 2 + lineHeight / 2;
+
+        lines.forEach((line, index) => {
+          ctx.fillText(line, textX, startY + index * lineHeight);
+        });
       }
       ctx.restore();
 
@@ -842,6 +1038,108 @@ const FigmaLite = () => {
     return () => window.removeEventListener('resize', handleResize);
   }, [drawScene]);
 
+  useEffect(() => {
+    const isEditableTarget = (target: EventTarget | null) => {
+      const el = target as HTMLElement | null;
+      if (!el) return false;
+      const tag = el.tagName?.toLowerCase();
+      return tag === 'input' || tag === 'textarea' || tag === 'select' || el.isContentEditable;
+    };
+
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (isEditableTarget(e.target)) return;
+
+      const mod = e.ctrlKey || e.metaKey;
+      const key = e.key.toLowerCase();
+
+      if (mod && e.shiftKey) {
+        if (key === 'l') {
+          e.preventDefault();
+          alignSelected('left');
+          return;
+        }
+        if (key === 'r') {
+          e.preventDefault();
+          alignSelected('right');
+          return;
+        }
+        if (key === 't') {
+          e.preventDefault();
+          alignSelected('top');
+          return;
+        }
+        if (key === 'b') {
+          e.preventDefault();
+          alignSelected('bottom');
+          return;
+        }
+        if (key === 'h') {
+          e.preventDefault();
+          alignSelected('centerX');
+          return;
+        }
+        if (key === 'v') {
+          e.preventDefault();
+          alignSelected('centerY');
+          return;
+        }
+      }
+
+      if (mod && (key === '=' || key === '+' || key === '-' || key === '0')) {
+        e.preventDefault();
+        if (key === '0') {
+          zoomToCenter(1);
+          return;
+        }
+        const step = key === '-' ? 1 / 1.1 : 1.1;
+        zoomToCenter(clampZoom(zoom * step));
+        return;
+      }
+
+      if (mod && key === 'd') {
+        e.preventDefault();
+        duplicateSelected();
+        return;
+      }
+
+      if (key === 'delete' || key === 'backspace') {
+        if (selectedId) {
+          e.preventDefault();
+          deleteSelected();
+        }
+        return;
+      }
+
+      if (!selectedElement) return;
+      const nudgeStep = e.shiftKey ? 10 : 1;
+      if (key === 'arrowleft') {
+        e.preventDefault();
+        nudgeSelected(-nudgeStep, 0);
+      } else if (key === 'arrowright') {
+        e.preventDefault();
+        nudgeSelected(nudgeStep, 0);
+      } else if (key === 'arrowup') {
+        e.preventDefault();
+        nudgeSelected(0, -nudgeStep);
+      } else if (key === 'arrowdown') {
+        e.preventDefault();
+        nudgeSelected(0, nudgeStep);
+      }
+    };
+
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [
+    alignSelected,
+    deleteSelected,
+    duplicateSelected,
+    nudgeSelected,
+    selectedElement,
+    selectedId,
+    zoom,
+    zoomToCenter
+  ]);
+
   const LayerItem = ({ el, depth = 0 }: { el: Element; depth?: number }) => {
     const [isOpen, setIsOpen] = useState(true);
     const hasChildren = el.children && el.children.length > 0;
@@ -867,7 +1165,11 @@ const FigmaLite = () => {
                 setIsOpen(!isOpen);
               }}
             >
-              {isOpen ? <ChevronDown className='h-3 w-3' /> : <ChevronRight className='h-3 w-3' />}
+              {isOpen ? (
+                <ChevronDownIcon className='h-3 w-3' />
+              ) : (
+                <ChevronRightIcon className='h-3 w-3' />
+              )}
             </button>
           ) : (
             <div className='w-3' />
@@ -1018,11 +1320,11 @@ const FigmaLite = () => {
             'relative w-[130vh] flex-1 touch-none bg-[#e5e5e5]',
             isDragging ? 'cursor-grabbing' : 'cursor-grab'
           )}
+          onPointerCancel={handlePointerUp}
           onPointerDown={handlePointerDown}
+          onPointerLeave={handlePointerUp}
           onPointerMove={handlePointerMove}
           onPointerUp={handlePointerUp}
-          onPointerLeave={handlePointerUp}
-          onPointerCancel={handlePointerUp}
           onWheel={handleWheel}
         />
         <aside className='z-10 flex w-72 shrink-0 flex-col border-l bg-white'>
@@ -1041,11 +1343,9 @@ const FigmaLite = () => {
                 Prototype
               </TabsTrigger>
             </TabsList>
-
             <TabsContent className='m-0 flex-1 overflow-auto p-0' value='design'>
               {selectedElement ? (
                 <div className='space-y-6 p-4'>
-                  {/* Position & Size */}
                   <div className='space-y-3'>
                     <h3 className='text-[10px] font-bold text-slate-400 uppercase'>Layout</h3>
                     <div className='grid grid-cols-2 gap-x-4 gap-y-2'>
@@ -1180,6 +1480,74 @@ const FigmaLite = () => {
                           value={selectedElement.fontSize}
                           onChange={(e) =>
                             updateElement(selectedId!, { fontSize: Number(e.target.value) })
+                          }
+                        />
+                        <Label className='text-[10px]'>Font Family</Label>
+                        <Select
+                          value={
+                            selectedElement.fontFamily || 'ui-sans-serif, system-ui, -apple-system'
+                          }
+                          onValueChange={(v) => updateElement(selectedId!, { fontFamily: v })}
+                        >
+                          <SelectTrigger className='h-8 text-xs'>
+                            <SelectValue />
+                          </SelectTrigger>
+                          <SelectContent>
+                            <SelectItem value='ui-sans-serif, system-ui, -apple-system'>
+                              Sans
+                            </SelectItem>
+                            <SelectItem value='ui-serif, Georgia, serif'>Serif</SelectItem>
+                            <SelectItem value='ui-monospace, SFMono-Regular, Menlo, monospace'>
+                              Mono
+                            </SelectItem>
+                            <SelectItem value='Arial, Helvetica, sans-serif'>Arial</SelectItem>
+                            <SelectItem value='Georgia, serif'>Georgia</SelectItem>
+                          </SelectContent>
+                        </Select>
+                        <Label className='text-[10px]'>Font Weight</Label>
+                        <Select
+                          value={String(selectedElement.fontWeight || 400)}
+                          onValueChange={(v) =>
+                            updateElement(selectedId!, { fontWeight: Number(v) })
+                          }
+                        >
+                          <SelectTrigger className='h-8 text-xs'>
+                            <SelectValue />
+                          </SelectTrigger>
+                          <SelectContent>
+                            <SelectItem value='300'>Light</SelectItem>
+                            <SelectItem value='400'>Regular</SelectItem>
+                            <SelectItem value='500'>Medium</SelectItem>
+                            <SelectItem value='600'>Semibold</SelectItem>
+                            <SelectItem value='700'>Bold</SelectItem>
+                          </SelectContent>
+                        </Select>
+                        <Label className='text-[10px]'>Alignment</Label>
+                        <Select
+                          value={selectedElement.textAlign || 'center'}
+                          onValueChange={(v) =>
+                            updateElement(selectedId!, {
+                              textAlign: v as 'center' | 'left' | 'right'
+                            })
+                          }
+                        >
+                          <SelectTrigger className='h-8 text-xs'>
+                            <SelectValue />
+                          </SelectTrigger>
+                          <SelectContent>
+                            <SelectItem value='left'>Left</SelectItem>
+                            <SelectItem value='center'>Center</SelectItem>
+                            <SelectItem value='right'>Right</SelectItem>
+                          </SelectContent>
+                        </Select>
+                        <Label className='text-[10px]'>Line Height</Label>
+                        <Input
+                          className='h-8 text-xs'
+                          step='0.1'
+                          type='number'
+                          value={selectedElement.lineHeight || 1.2}
+                          onChange={(e) =>
+                            updateElement(selectedId!, { lineHeight: Number(e.target.value) })
                           }
                         />
                         <Label className='text-[10px]'>Text</Label>
