@@ -65,3 +65,9 @@ export interface SelectionRect {
   x: number;
   y: number;
 }
+
+export interface HistoryState {
+  elements: Element[];
+  masters: Record<string, Element>;
+  selectedIds: string[];
+}

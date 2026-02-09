@@ -40,6 +40,7 @@ import type {
   Element,
   ElementType,
   GradientFill,
+  HistoryState,
   HorizontalConstraint,
   ResizeHandle,
   SelectionRect,
@@ -67,12 +68,6 @@ import {
 const GRID_SIZE = 24;
 const HANDLE_SIZE = 8;
 const HISTORY_LIMIT = 100;
-
-type HistoryState = {
-  elements: Element[];
-  masters: Record<string, Element>;
-  selectedIds: string[];
-};
 
 const FigmaLite = () => {
   const [elements, setElements] = useState<Element[]>(() => {
