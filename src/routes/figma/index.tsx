@@ -34,7 +34,7 @@ import {
 } from '@/components/ui/select.tsx';
 import { Separator } from '@/components/ui/separator.tsx';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs.tsx';
-import { LayerItem } from './LayerItem';
+
 import type {
   DuplicateResult,
   Element,
@@ -45,6 +45,8 @@ import type {
   SelectionRect,
   VerticalConstraint
 } from './types';
+
+import { LayerItem } from './LayerItem';
 import {
   clampZoom,
   cloneElement,
@@ -64,6 +66,14 @@ import {
 
 const GRID_SIZE = 24;
 const HANDLE_SIZE = 8;
+const HISTORY_LIMIT = 100;
+
+type HistoryState = {
+  elements: Element[];
+  masters: Record<string, Element>;
+  selectedIds: string[];
+};
+
 const FigmaLite = () => {
   const [elements, setElements] = useState<Element[]>(() => {
     const loginFrame: Element = {
@@ -339,6 +349,9 @@ const FigmaLite = () => {
   const imageCacheRef = useRef<Map<string, HTMLImageElement>>(new Map());
   const rafRef = useRef<number | null>(null);
   const pendingUpdateRef = useRef<Array<{ id: string; updates: Partial<Element> }> | null>(null);
+  const historyRef = useRef<HistoryState[]>([]);
+  const redoRef = useRef<HistoryState[]>([]);
+  const isRestoringRef = useRef(false);
   const dragRef = useRef<
     | {
         mode: 'marquee';
@@ -354,6 +367,7 @@ const FigmaLite = () => {
         positions: Record<string, { x: number; y: number }>;
         startX: number;
         startY: number;
+        hasHistory: boolean;
       }
     | {
         mode: 'pan';
@@ -373,6 +387,7 @@ const FigmaLite = () => {
         elW: number;
         elH: number;
         aspect: number;
+        hasHistory: boolean;
       }
     | null
   >(null);
@@ -392,6 +407,58 @@ const FigmaLite = () => {
     [elements, selectedIds]
   );
   const canReorder = reorderableSelection.length > 0;
+
+  const snapshotState = useCallback(
+    (): HistoryState => ({
+      elements: structuredClone(elements),
+      masters: structuredClone(masters),
+      selectedIds: structuredClone(selectedIds)
+    }),
+    [elements, masters, selectedIds]
+  );
+
+  const pushHistory = useCallback(() => {
+    if (isRestoringRef.current) return;
+    historyRef.current.push(snapshotState());
+    if (historyRef.current.length > HISTORY_LIMIT) {
+      historyRef.current.shift();
+    }
+    redoRef.current = [];
+  }, [snapshotState]);
+
+  const restoreState = useCallback((snapshot: HistoryState) => {
+    isRestoringRef.current = true;
+    dragRef.current = null;
+    if (rafRef.current !== null) {
+      window.cancelAnimationFrame(rafRef.current);
+      rafRef.current = null;
+    }
+    pendingUpdateRef.current = null;
+    setIsDragging(false);
+    setActiveHandle(null);
+    setHoverHandle(null);
+    setSelectionBox(null);
+    setElements(snapshot.elements);
+    setMasters(snapshot.masters);
+    setSelectedIds(snapshot.selectedIds);
+    window.requestAnimationFrame(() => {
+      isRestoringRef.current = false;
+    });
+  }, []);
+
+  const undo = useCallback(() => {
+    const previous = historyRef.current.pop();
+    if (!previous) return;
+    redoRef.current.push(snapshotState());
+    restoreState(previous);
+  }, [restoreState, snapshotState]);
+
+  const redo = useCallback(() => {
+    const next = redoRef.current.pop();
+    if (!next) return;
+    historyRef.current.push(snapshotState());
+    restoreState(next);
+  }, [restoreState, snapshotState]);
 
   const normalizeSelection = useCallback(
     (ids: string[], primaryId?: string | null) => {
@@ -429,6 +496,7 @@ const FigmaLite = () => {
   );
 
   const addElement = (type: ElementType) => {
+    pushHistory();
     const parentFrame = selectedElement?.type === 'frame' ? selectedElement : null;
 
     const newEl: Element = {
@@ -467,13 +535,14 @@ const FigmaLite = () => {
 
   const updateElement = useCallback(
     (id: string, updates: Partial<Element>) => {
+      pushHistory();
       if (masters[id]) {
         setMasters((prev) => ({ ...prev, [id]: { ...prev[id], ...updates } }));
         return;
       }
       setElements((prev) => updateElementInList(prev, id, updates));
     },
-    [masters]
+    [masters, pushHistory]
   );
 
   const updateFillGradient = useCallback(
@@ -491,6 +560,7 @@ const FigmaLite = () => {
 
   const deleteSelected = () => {
     if (selectedIds.length === 0) return;
+    pushHistory();
     const topLevel = getTopLevelSelection(elements, new Set(selectedIds));
     setElements((prev) => topLevel.reduce((acc, id) => deleteElementFromList(acc, id), prev));
     setSelectedIds([]);
@@ -560,6 +630,7 @@ const FigmaLite = () => {
           imageFit: parentFrame ? 'cover' : 'contain'
         };
 
+        pushHistory();
         if (parentFrame) {
           setElements((prev) =>
             updateElementInList(prev, parentFrame.id, {
@@ -575,7 +646,7 @@ const FigmaLite = () => {
       };
       img.src = src;
     },
-    [elements, selectedElement, selectedId]
+    [elements, pushHistory, selectedElement, selectedId]
   );
 
   const handleImageInputChange = useCallback(
@@ -674,6 +745,7 @@ const FigmaLite = () => {
 
   const duplicateSelected = useCallback(() => {
     if (!selectedId || !selectedElement) return;
+    pushHistory();
 
     if (masters[selectedId]) {
       const clone = cloneElement(masters[selectedId], true);
@@ -687,7 +759,15 @@ const FigmaLite = () => {
       setElements(result.elements);
       setSelection([result.duplicated.id], result.duplicated.id);
     }
-  }, [duplicateElementInList, elements, masters, selectedElement, selectedId, setSelection]);
+  }, [
+    duplicateElementInList,
+    elements,
+    masters,
+    pushHistory,
+    selectedElement,
+    selectedId,
+    setSelection
+  ]);
 
   const groupSelected = useCallback(() => {
     if (selectedIds.length < 2) return;
@@ -705,6 +785,7 @@ const FigmaLite = () => {
       return;
     }
 
+    pushHistory();
     const sourceList = parent ? parent.children || [] : elements;
     const selectedSet = new Set(topLevel);
     const selectedElements = sourceList.filter((el) => selectedSet.has(el.id));
@@ -748,11 +829,14 @@ const FigmaLite = () => {
     }
 
     setSelection([group.id], group.id);
-  }, [elements, selectedIds, setSelection]);
+  }, [elements, pushHistory, selectedIds, setSelection]);
 
   const ungroupSelected = useCallback(() => {
     if (selectedIds.length === 0) return;
     const topLevel = getTopLevelSelection(elements, new Set(selectedIds));
+    const hasGroup = topLevel.some((id) => findElementById(elements, id)?.type === 'group');
+    if (!hasGroup) return;
+    pushHistory();
     const selectedSet = new Set(topLevel);
     const retained = topLevel.filter((id) => {
       const el = findElementById(elements, id);
@@ -788,14 +872,15 @@ const FigmaLite = () => {
     } else {
       setSelectedIds([]);
     }
-  }, [elements, selectedIds, setSelection]);
+  }, [elements, pushHistory, selectedIds, setSelection]);
 
   const reorderSelected = useCallback(
     (direction: 'backward' | 'forward') => {
       if (selectedIds.length === 0) return;
+      const topLevel = getTopLevelSelection(elements, new Set(selectedIds));
+      if (topLevel.length === 0) return;
+      pushHistory();
       setElements((prev) => {
-        const topLevel = getTopLevelSelection(prev, new Set(selectedIds));
-        if (topLevel.length === 0) return prev;
         const selectedSet = new Set(topLevel);
 
         const reorderList = (list: Element[]): Element[] => {
@@ -827,7 +912,7 @@ const FigmaLite = () => {
         return reorderList(prev);
       });
     },
-    [selectedIds]
+    [elements, pushHistory, selectedIds]
   );
 
   const nudgeSelected = useCallback(
@@ -842,10 +927,11 @@ const FigmaLite = () => {
       }
 
       if (updates.length > 0) {
+        pushHistory();
         scheduleElementsUpdate(updates);
       }
     },
-    [elements, scheduleElementsUpdate, selectedIds]
+    [elements, pushHistory, scheduleElementsUpdate, selectedIds]
   );
 
   const alignSelected = useCallback(
@@ -1001,7 +1087,8 @@ const FigmaLite = () => {
         elY: selectedElement.y,
         elW: selectedElement.width,
         elH: selectedElement.height,
-        aspect: selectedElement.width / Math.max(1, selectedElement.height)
+        aspect: selectedElement.width / Math.max(1, selectedElement.height),
+        hasHistory: false
       };
       (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
       return;
@@ -1043,7 +1130,8 @@ const FigmaLite = () => {
         ids: validIds,
         positions,
         startX: e.clientX,
-        startY: e.clientY
+        startY: e.clientY,
+        hasHistory: false
       };
     } else {
       if (isSpacePressed || e.button === 1) {
@@ -1095,6 +1183,10 @@ const FigmaLite = () => {
 
     if (state.mode === 'move') {
       const updates: Array<{ id: string; updates: Partial<Element> }> = [];
+      if (!state.hasHistory && (dx !== 0 || dy !== 0)) {
+        pushHistory();
+        state.hasHistory = true;
+      }
       for (const id of state.ids) {
         const position = state.positions[id];
         if (!position) continue;
@@ -1132,7 +1224,7 @@ const FigmaLite = () => {
       if (moveTop) top += dy;
       if (moveBottom) bottom += dy;
 
-      const snap = (value: number) => Math.round(value / GRID_SIZE) * GRID_SIZE;
+      const snap = (value: number) => Math.round(value);
       const minSize = 16;
       const aspect = state.aspect || 1;
 
@@ -1218,7 +1310,29 @@ const FigmaLite = () => {
         }
       }
 
-      scheduleElementsUpdate([{ id: state.id, updates: { x: left, y: top, width, height } }]);
+      const nextX = Math.round(left);
+      const nextY = Math.round(top);
+      const nextW = Math.round(width);
+      const nextH = Math.round(height);
+      if (
+        !state.hasHistory &&
+        (nextX !== state.elX || nextY !== state.elY || nextW !== state.elW || nextH !== state.elH)
+      ) {
+        pushHistory();
+        state.hasHistory = true;
+      }
+
+      scheduleElementsUpdate([
+        {
+          id: state.id,
+          updates: {
+            x: nextX,
+            y: nextY,
+            width: nextW,
+            height: nextH
+          }
+        }
+      ]);
     }
   };
 
@@ -1275,6 +1389,7 @@ const FigmaLite = () => {
   const createInstance = (masterId: string) => {
     const master = masters[masterId];
     if (!master) return;
+    pushHistory();
     const instance: Element = {
       ...master,
       id: generateId(),
@@ -1613,6 +1728,24 @@ const FigmaLite = () => {
         ctx.lineWidth = 2 / zoom;
         ctx.strokeRect(x - 1, y - 1, el.width + 2, el.height + 2);
         if (selectedIds.length === 1) {
+          const labelText = `${Math.round(el.width)} x ${Math.round(el.height)}`;
+          const fontSize = 9 / zoom;
+          const paddingX = 4 / zoom;
+          const paddingY = 2 / zoom;
+          ctx.font = `${fontSize}px ui-sans-serif, system-ui, -apple-system`;
+          const metrics = ctx.measureText(labelText);
+          const labelWidth = metrics.width + paddingX * 2;
+          const labelHeight = fontSize + paddingY * 2;
+          const gap = 6 / zoom;
+          const labelX = x;
+          const labelY = y - labelHeight - gap;
+          ctx.fillStyle = 'rgba(15, 23, 42, 0.85)';
+          ctx.fillRect(labelX, labelY, labelWidth, labelHeight);
+          ctx.fillStyle = '#ffffff';
+          ctx.textAlign = 'left';
+          ctx.textBaseline = 'top';
+          ctx.fillText(labelText, labelX + paddingX, labelY + paddingY);
+
           const handleSize = HANDLE_SIZE / zoom;
           const half = handleSize / 2;
           const handles: Array<{ x: number; y: number }> = [
@@ -1683,6 +1816,16 @@ const FigmaLite = () => {
 
       const mod = e.ctrlKey || e.metaKey;
       const key = e.key.toLowerCase();
+
+      if (mod && key === 'z') {
+        e.preventDefault();
+        if (e.shiftKey) {
+          redo();
+        } else {
+          undo();
+        }
+        return;
+      }
 
       if (mod && key === 'g') {
         e.preventDefault();
@@ -1794,8 +1937,10 @@ const FigmaLite = () => {
     groupSelected,
     nudgeSelected,
     reorderSelected,
+    redo,
     selectedElement,
     selectedId,
+    undo,
     ungroupSelected,
     zoom,
     zoomToCenter
