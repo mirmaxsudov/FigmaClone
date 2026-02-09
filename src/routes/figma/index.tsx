@@ -1,7 +1,7 @@
 import { createFileRoute, Link } from '@tanstack/react-router';
 import {
-  ChevronDownIcon,
-  ChevronRightIcon,
+  ArrowDown,
+  ArrowUp,
   CircleIcon,
   ComponentIcon,
   CopyIcon,
@@ -34,276 +34,36 @@ import {
 } from '@/components/ui/select.tsx';
 import { Separator } from '@/components/ui/separator.tsx';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs.tsx';
-import { cn } from '@/lib/utils.ts';
+import { LayerItem } from './LayerItem';
+import type {
+  DuplicateResult,
+  Element,
+  ElementType,
+  GradientFill,
+  HorizontalConstraint,
+  ResizeHandle,
+  SelectionRect,
+  VerticalConstraint
+} from './types';
+import {
+  clampZoom,
+  cloneElement,
+  collectElementsInRect,
+  cursorForHandle,
+  defaultGradientStops,
+  deleteElementFromList,
+  escapeXML,
+  findElementBounds,
+  findElementById,
+  findParentElement,
+  generateId,
+  getCanvasFill,
+  getTopLevelSelection,
+  updateElementInList
+} from './utils';
 
-type HorizontalConstraint = 'both' | 'center' | 'left' | 'right' | 'scale';
-type VerticalConstraint = 'both' | 'bottom' | 'center' | 'scale' | 'top';
-
-interface Constraints {
-  horizontal: HorizontalConstraint;
-  vertical: VerticalConstraint;
-}
-
-type ElementType = 'circle' | 'frame' | 'group' | 'image' | 'instance' | 'rect' | 'text';
-type ResizeHandle = 'e' | 'n' | 'ne' | 'nw' | 's' | 'se' | 'sw' | 'w';
-
-interface Element {
-  children?: Element[];
-  constraints: Constraints;
-  fill: string;
-  fontFamily?: string;
-  fontSize?: number;
-  fontWeight?: number;
-  height: number;
-  id: string;
-  imageFit?: 'contain' | 'cover' | 'fill';
-  imageSrc?: string;
-  lineHeight?: number;
-  masterId?: string;
-  name: string;
-  opacity: number;
-  stroke: string;
-  strokeWidth: number;
-  text?: string;
-  textAlign?: 'center' | 'left' | 'right';
-  type: ElementType;
-  width: number;
-  x: number;
-  y: number;
-}
-
-const generateId = () => Math.random().toString(36).substring(2, 9);
-const clampZoom = (value: number) => Math.min(5, Math.max(0.1, value));
 const GRID_SIZE = 24;
 const HANDLE_SIZE = 8;
-const escapeXML = (value: string) =>
-  value.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-const cursorForHandle = (handle: ResizeHandle) => {
-  switch (handle) {
-    case 'nw':
-    case 'se':
-      return 'nwse-resize';
-    case 'ne':
-    case 'sw':
-      return 'nesw-resize';
-    case 'n':
-    case 's':
-      return 'ns-resize';
-    case 'e':
-    case 'w':
-      return 'ew-resize';
-    default:
-      return 'default';
-  }
-};
-
-interface DuplicateResult {
-  duplicated: Element | null;
-  elements: Element[];
-}
-
-interface ElementBounds {
-  height: number;
-  width: number;
-  x: number;
-  y: number;
-}
-
-interface SelectionRect {
-  height: number;
-  width: number;
-  x: number;
-  y: number;
-}
-
-const findElementById = (elements: Element[], id: string): Element | null => {
-  for (const el of elements) {
-    if (el.id === id) return el;
-    if (el.children) {
-      const found = findElementById(el.children, id);
-      if (found) return found;
-    }
-  }
-  return null;
-};
-
-const findElementBounds = (
-  elements: Element[],
-  id: string,
-  offsetX = 0,
-  offsetY = 0
-): ElementBounds | null => {
-  for (const el of elements) {
-    const x = offsetX + el.x;
-    const y = offsetY + el.y;
-    if (el.id === id) {
-      return { x, y, width: el.width, height: el.height };
-    }
-    if (el.children) {
-      const found = findElementBounds(el.children, id, x, y);
-      if (found) return found;
-    }
-  }
-  return null;
-};
-
-const getTopLevelSelection = (elements: Element[], selectedSet: Set<string>): string[] => {
-  const result: string[] = [];
-  const visit = (list: Element[], ancestorSelected: boolean) => {
-    for (const el of list) {
-      const isSelected = selectedSet.has(el.id);
-      if (isSelected && !ancestorSelected) {
-        result.push(el.id);
-      }
-      const nextAncestor = ancestorSelected || isSelected;
-      if (el.children) {
-        visit(el.children, nextAncestor);
-      }
-    }
-  };
-  visit(elements, false);
-  return result;
-};
-
-const collectElementsInRect = (elements: Element[], rect: SelectionRect): string[] => {
-  const ids: string[] = [];
-  const visit = (list: Element[], offsetX: number, offsetY: number) => {
-    for (const el of list) {
-      const x = offsetX + el.x;
-      const y = offsetY + el.y;
-      const within =
-        rect.x <= x &&
-        rect.y <= y &&
-        rect.x + rect.width >= x + el.width &&
-        rect.y + rect.height >= y + el.height;
-
-      if (within) {
-        ids.push(el.id);
-      }
-
-      if (el.children) {
-        visit(el.children, x, y);
-      }
-    }
-  };
-
-  visit(elements, 0, 0);
-  return ids;
-};
-
-const findParentElement = (
-  elements: Element[],
-  id: string,
-  parent: Element | null = null
-): Element | null => {
-  for (const el of elements) {
-    if (el.id === id) return parent;
-    if (el.children) {
-      const found = findParentElement(el.children, id, el);
-      if (found) return found;
-    }
-  }
-  return null;
-};
-
-const cloneElement = (el: Element, rename = false): Element => ({
-  ...el,
-  id: generateId(),
-  name: rename ? `${el.name} CopyIcon` : el.name,
-  children: el.children ? el.children.map((child) => cloneElement(child)) : undefined
-});
-
-const updateElementInList = (
-  elements: Element[],
-  id: string,
-  updates: Partial<Element>
-): Element[] => {
-  return elements.map((el) => {
-    if (el.id === id) {
-      const updated = { ...el, ...updates };
-      if (
-        el.type === 'frame' &&
-        el.children &&
-        (updates.width !== undefined || updates.height !== undefined)
-      ) {
-        updated.children = el.children.map((child) =>
-          applyConstraints(
-            child,
-            el.width,
-            el.height,
-            updates.width ?? el.width,
-            updates.height ?? el.height
-          )
-        );
-      }
-      return updated;
-    }
-    if (el.children) {
-      return { ...el, children: updateElementInList(el.children, id, updates) };
-    }
-    return el;
-  });
-};
-
-const deleteElementFromList = (elements: Element[], id: string): Element[] => {
-  return elements
-    .filter((el) => el.id !== id)
-    .map((el) => ({
-      ...el,
-      children: el.children ? deleteElementFromList(el.children, id) : undefined
-    }));
-};
-
-const applyConstraints = (
-  element: Element,
-  oldParentW: number,
-  oldParentH: number,
-  newParentW: number,
-  newParentH: number
-): Element => {
-  let { x, y, width, height } = element;
-  const dw = newParentW - oldParentW;
-  const dh = newParentH - oldParentH;
-
-  switch (element.constraints.horizontal) {
-    case 'right':
-      x += dw;
-      break;
-    case 'both':
-      width += dw;
-      break;
-    case 'center':
-      x = newParentW / 2 - oldParentW / 2 + x;
-      break;
-    case 'scale': {
-      const ratioX = newParentW / oldParentW;
-      x *= ratioX;
-      width *= ratioX;
-      break;
-    }
-  }
-
-  switch (element.constraints.vertical) {
-    case 'bottom':
-      y += dh;
-      break;
-    case 'both':
-      height += dh;
-      break;
-    case 'center':
-      y = newParentH / 2 - oldParentH / 2 + y;
-      break;
-    case 'scale': {
-      const ratioY = newParentH / oldParentH;
-      y *= ratioY;
-      height *= ratioY;
-      break;
-    }
-  }
-
-  return { ...element, x, y, width, height };
-};
-
 const FigmaLite = () => {
   const [elements, setElements] = useState<Element[]>(() => {
     const loginFrame: Element = {
@@ -622,6 +382,16 @@ const FigmaLite = () => {
     () => (selectedId ? findElementById(elements, selectedId) || masters[selectedId] : null),
     [elements, masters, selectedId]
   );
+  const fillMode = selectedElement?.fillGradient?.type ?? 'solid';
+  const gradientStops =
+    selectedElement?.fillGradient?.stops && selectedElement.fillGradient.stops.length > 0
+      ? selectedElement.fillGradient.stops
+      : defaultGradientStops(selectedElement?.fill ?? '#e2e8f0');
+  const reorderableSelection = useMemo(
+    () => getTopLevelSelection(elements, new Set(selectedIds)),
+    [elements, selectedIds]
+  );
+  const canReorder = reorderableSelection.length > 0;
 
   const normalizeSelection = useCallback(
     (ids: string[], primaryId?: string | null) => {
@@ -704,6 +474,19 @@ const FigmaLite = () => {
       setElements((prev) => updateElementInList(prev, id, updates));
     },
     [masters]
+  );
+
+  const updateFillGradient = useCallback(
+    (updater: (current: GradientFill) => GradientFill) => {
+      if (!selectedId || !selectedElement) return;
+      const base: GradientFill = selectedElement.fillGradient ?? {
+        type: 'linear',
+        angle: 0,
+        stops: defaultGradientStops(selectedElement.fill || '#e2e8f0')
+      };
+      updateElement(selectedId, { fillGradient: updater(base) });
+    },
+    [selectedElement, selectedId, updateElement]
   );
 
   const deleteSelected = () => {
@@ -1006,6 +789,46 @@ const FigmaLite = () => {
       setSelectedIds([]);
     }
   }, [elements, selectedIds, setSelection]);
+
+  const reorderSelected = useCallback(
+    (direction: 'backward' | 'forward') => {
+      if (selectedIds.length === 0) return;
+      setElements((prev) => {
+        const topLevel = getTopLevelSelection(prev, new Set(selectedIds));
+        if (topLevel.length === 0) return prev;
+        const selectedSet = new Set(topLevel);
+
+        const reorderList = (list: Element[]): Element[] => {
+          const next = list.map((el) =>
+            el.children ? { ...el, children: reorderList(el.children) } : el
+          );
+
+          if (direction === 'forward') {
+            for (let i = next.length - 2; i >= 0; i -= 1) {
+              if (selectedSet.has(next[i].id) && !selectedSet.has(next[i + 1].id)) {
+                const temp = next[i + 1];
+                next[i + 1] = next[i];
+                next[i] = temp;
+              }
+            }
+          } else {
+            for (let i = 1; i < next.length; i += 1) {
+              if (selectedSet.has(next[i].id) && !selectedSet.has(next[i - 1].id)) {
+                const temp = next[i - 1];
+                next[i - 1] = next[i];
+                next[i] = temp;
+              }
+            }
+          }
+
+          return next;
+        };
+
+        return reorderList(prev);
+      });
+    },
+    [selectedIds]
+  );
 
   const nudgeSelected = useCallback(
     (dx: number, dy: number) => {
@@ -1449,15 +1272,6 @@ const FigmaLite = () => {
     zoomAtPoint(nextZoom, e.clientX, e.clientY);
   };
 
-  const createMaster = () => {
-    if (!selectedElement) return;
-    const masterId = generateId();
-    setMasters((prev) => ({
-      ...prev,
-      [masterId]: { ...selectedElement, id: masterId, name: `Master: ${selectedElement.name}` }
-    }));
-  };
-
   const createInstance = (masterId: string) => {
     const master = masters[masterId];
     if (!master) return;
@@ -1489,14 +1303,67 @@ const FigmaLite = () => {
       return;
     }
 
+    const gradientDefs: string[] = [];
+    const gradientIds = new Map<string, string>();
+
+    const buildGradientDef = (el: Element, id: string) => {
+      if (!el.fillGradient) return '';
+      const gradient = el.fillGradient;
+      const stops =
+        gradient.stops && gradient.stops.length > 0
+          ? gradient.stops
+          : defaultGradientStops(el.fill || '#e2e8f0');
+      const stopMarkup = stops
+        .slice()
+        .sort((a, b) => a.offset - b.offset)
+        .map((stop) => {
+          const offset = Math.min(1, Math.max(0, stop.offset));
+          const opacity = stop.opacity ?? 1;
+          return `<stop offset="${offset * 100}%" stop-color="${stop.color}"${
+            opacity < 1 ? ` stop-opacity="${opacity}"` : ''
+          } />`;
+        })
+        .join('');
+
+      if (gradient.type === 'linear') {
+        const angle = ((gradient.angle ?? 0) * Math.PI) / 180;
+        const x1 = 0.5 - Math.cos(angle) / 2;
+        const y1 = 0.5 - Math.sin(angle) / 2;
+        const x2 = 0.5 + Math.cos(angle) / 2;
+        const y2 = 0.5 + Math.sin(angle) / 2;
+        return `<linearGradient id="${id}" x1="${x1}" y1="${y1}" x2="${x2}" y2="${y2}">${stopMarkup}</linearGradient>`;
+      }
+
+      return `<radialGradient id="${id}" cx="0.5" cy="0.5" r="0.5">${stopMarkup}</radialGradient>`;
+    };
+
+    const collectGradients = (list: Element[]) => {
+      for (const el of list) {
+        if (el.fillGradient) {
+          const id = `grad-${el.id}`;
+          if (!gradientIds.has(el.id)) {
+            gradientIds.set(el.id, id);
+            gradientDefs.push(buildGradientDef(el, id));
+          }
+        }
+        if (el.children) {
+          collectGradients(el.children);
+        }
+      }
+    };
+
+    collectGradients([frame]);
+
     const renderSVGElement = (el: Element): string => {
       let content = '';
+      const fill =
+        el.fillGradient && gradientIds.has(el.id) ? `url(#${gradientIds.get(el.id)})` : el.fill;
       if (el.type === 'group') {
         // groups are visual containers only
       } else if (el.type === 'rect' || el.type === 'frame' || el.type === 'instance') {
-        content = `<rect x="${el.x}" y="${el.y}" width="${el.width}" height="${el.height}" fill="${el.fill}" stroke="${el.stroke}" stroke-width="${el.strokeWidth}" fill-opacity="${el.opacity}" />`;
+        content = `<rect x="${el.x}" y="${el.y}" width="${el.width}" height="${el.height}" fill="${fill}" stroke="${el.stroke}" stroke-width="${el.strokeWidth}" fill-opacity="${el.opacity}" />`;
       } else if (el.type === 'circle') {
-        content = `<circle cx="${el.x + el.width / 2}" cy="${el.y + el.height / 2}" r="${el.width / 2}" fill="${el.fill}" stroke="${el.stroke}" stroke-width="${el.strokeWidth}" fill-opacity="${el.opacity}" />`;
+        content = `<circle cx="${el.x + el.width / 2}" cy="${el.y + el.height / 2}" r="${el.width / 2}" fill="${fill}" stroke="${el.stroke}" stroke-width="${el.strokeWidth}" fill-opacity="${el.opacity}" />`;
       } else if (el.type === 'image') {
         if (el.imageSrc) {
           const fit = el.imageFit || 'contain';
@@ -1523,7 +1390,7 @@ const FigmaLite = () => {
           })
           .join('');
 
-        content = `<text x="${textX}" y="${startY}" fill="${el.fill}" font-size="${fontSize}" font-family="${fontFamily}" font-weight="${fontWeight}" text-anchor="${anchor}" dominant-baseline="middle">${tspans}</text>`;
+        content = `<text x="${textX}" y="${startY}" fill="${fill}" font-size="${fontSize}" font-family="${fontFamily}" font-weight="${fontWeight}" text-anchor="${anchor}" dominant-baseline="middle">${tspans}</text>`;
       }
 
       if (el.children) {
@@ -1534,7 +1401,8 @@ const FigmaLite = () => {
       return content;
     };
 
-    const svg = `<svg width="${frame.width}" height="${frame.height}" viewBox="0 0 ${frame.width} ${frame.height}" xmlns="http://www.w3.org/2000/svg">${renderSVGElement(
+    const defs = gradientDefs.length > 0 ? `<defs>${gradientDefs.join('')}</defs>` : '';
+    const svg = `<svg width="${frame.width}" height="${frame.height}" viewBox="0 0 ${frame.width} ${frame.height}" xmlns="http://www.w3.org/2000/svg">${defs}${renderSVGElement(
       {
         ...frame,
         x: 0,
@@ -1605,8 +1473,9 @@ const FigmaLite = () => {
       ctx.globalAlpha = el.opacity;
 
       if (el.type === 'rect' || el.type === 'frame' || el.type === 'instance') {
-        if (el.fill) {
-          ctx.fillStyle = el.fill;
+        const fillPaint = getCanvasFill(ctx, el, x, y);
+        if (fillPaint) {
+          ctx.fillStyle = fillPaint;
           ctx.fillRect(x, y, el.width, el.height);
         }
         if (el.strokeWidth > 0 && el.stroke) {
@@ -1620,8 +1489,9 @@ const FigmaLite = () => {
         const cy = y + radius;
         ctx.beginPath();
         ctx.arc(cx, cy, radius, 0, Math.PI * 2);
-        if (el.fill) {
-          ctx.fillStyle = el.fill;
+        const fillPaint = getCanvasFill(ctx, el, x, y);
+        if (fillPaint) {
+          ctx.fillStyle = fillPaint;
           ctx.fill();
         }
         if (el.strokeWidth > 0 && el.stroke) {
@@ -1686,7 +1556,8 @@ const FigmaLite = () => {
         const lineHeight = (el.lineHeight || 1.2) * fontSize;
         const lines = (el.text || '').split('\n');
 
-        ctx.fillStyle = el.fill || '#000000';
+        const fillPaint = getCanvasFill(ctx, el, x, y);
+        ctx.fillStyle = fillPaint || el.fill || '#000000';
         ctx.font = `${fontWeight} ${fontSize}px ${fontFamily}`;
         ctx.textAlign = align;
         ctx.textBaseline = 'middle';
@@ -1856,6 +1727,12 @@ const FigmaLite = () => {
         }
       }
 
+      if (mod && (key === ']' || key === '[')) {
+        e.preventDefault();
+        reorderSelected(key === ']' ? 'forward' : 'backward');
+        return;
+      }
+
       if (mod && (key === '=' || key === '+' || key === '-' || key === '0')) {
         e.preventDefault();
         if (key === '0') {
@@ -1916,65 +1793,13 @@ const FigmaLite = () => {
     duplicateSelected,
     groupSelected,
     nudgeSelected,
+    reorderSelected,
     selectedElement,
     selectedId,
     ungroupSelected,
     zoom,
     zoomToCenter
   ]);
-
-  const LayerItem = ({ el, depth = 0 }: { el: Element; depth?: number }) => {
-    const [isOpen, setIsOpen] = useState(true);
-    const hasChildren = el.children && el.children.length > 0;
-    const isSelected = selectedIds.includes(el.id);
-
-    return (
-      <div>
-        <div
-          className={cn(
-            'flex cursor-pointer items-center gap-2 px-2 py-1 text-xs hover:bg-slate-100',
-            isSelected && 'bg-blue-50 font-medium text-blue-600'
-          )}
-          style={{ paddingLeft: `${depth * 12 + 8}px` }}
-          onClick={(e) => {
-            e.stopPropagation();
-            if (e.shiftKey) {
-              toggleSelection(el.id);
-            } else {
-              setSelection([el.id], el.id);
-            }
-          }}
-        >
-          {hasChildren ? (
-            <button
-              onClick={(e) => {
-                e.stopPropagation();
-                setIsOpen(!isOpen);
-              }}
-            >
-              {isOpen ? (
-                <ChevronDownIcon className='h-3 w-3' />
-              ) : (
-                <ChevronRightIcon className='h-3 w-3' />
-              )}
-            </button>
-          ) : (
-            <div className='w-3' />
-          )}
-          {el.type === 'frame' && <Monitor className='h-3 w-3' />}
-          {el.type === 'rect' && <Square className='h-3 w-3' />}
-          {el.type === 'circle' && <CircleIcon className='h-3 w-3' />}
-          {el.type === 'group' && <Layout className='h-3 w-3' />}
-          {el.type === 'image' && <ImageIcon className='h-3 w-3' />}
-          {el.type === 'text' && <Type className='h-3 w-3' />}
-          {el.type === 'instance' && <ComponentIcon className='h-3 w-3 text-purple-500' />}
-          <span className='truncate'>{el.name}</span>
-        </div>
-        {isOpen &&
-          el.children?.map((child) => <LayerItem key={child.id} depth={depth + 1} el={child} />)}
-      </div>
-    );
-  };
 
   return (
     <div className='flex h-screen flex-col overflow-hidden bg-slate-50 font-sans text-slate-900'>
@@ -2100,10 +1925,41 @@ const FigmaLite = () => {
               className='m-0 flex min-h-0 flex-1 flex-col overflow-hidden p-0'
               value='layers'
             >
+              <div className='flex items-center justify-between border-b px-3 py-2'>
+                <span className='text-[10px] font-bold text-slate-400 uppercase'>Order</span>
+                <div className='flex items-center gap-1'>
+                  <Button
+                    aria-label='Send backward'
+                    className='h-7 w-7'
+                    disabled={!canReorder}
+                    size='icon'
+                    variant='ghost'
+                    onClick={() => reorderSelected('backward')}
+                  >
+                    <ArrowDown className='h-3.5 w-3.5' />
+                  </Button>
+                  <Button
+                    aria-label='Bring forward'
+                    className='h-7 w-7'
+                    disabled={!canReorder}
+                    size='icon'
+                    variant='ghost'
+                    onClick={() => reorderSelected('forward')}
+                  >
+                    <ArrowUp className='h-3.5 w-3.5' />
+                  </Button>
+                </div>
+              </div>
               <ScrollArea className='flex-1'>
                 <div className='py-2'>
                   {elements.map((el) => (
-                    <LayerItem key={el.id} el={el} />
+                    <LayerItem
+                      key={el.id}
+                      el={el}
+                      selectedIds={selectedIds}
+                      setSelection={setSelection}
+                      toggleSelection={toggleSelection}
+                    />
                   ))}
                 </div>
                 {Object.keys(masters).length > 0 && (
@@ -2220,7 +2076,9 @@ const FigmaLite = () => {
                     </div>
                     <Separator />
                     <div className='space-y-3'>
-                      <h3 className='text-[10px] font-bold text-slate-400 uppercase'>Constraints</h3>
+                      <h3 className='text-[10px] font-bold text-slate-400 uppercase'>
+                        Constraints
+                      </h3>
                       <div className='grid grid-cols-1 gap-2'>
                         <div className='space-y-1'>
                           <Label className='text-[10px]'>Horizontal</Label>
@@ -2277,23 +2135,163 @@ const FigmaLite = () => {
                     <Separator />
                     <div className='space-y-3'>
                       <h3 className='text-[10px] font-bold text-slate-400 uppercase'>Fill</h3>
-                      <div className='flex items-center gap-2'>
-                        <Input
-                          className='h-8 w-12 border-none bg-transparent p-1'
-                          type='color'
-                          value={selectedElement.fill}
-                          onChange={(e) => updateElement(selectedId!, { fill: e.target.value })}
-                        />
-                        <Input
-                          className='h-8 flex-1 text-xs'
-                          type='text'
-                          value={selectedElement.fill}
-                          onChange={(e) => updateElement(selectedId!, { fill: e.target.value })}
-                        />
-                        <div className='w-8 text-[10px] text-slate-400'>
-                          {Math.round(selectedElement.opacity * 100)}%
-                        </div>
+                      <div className='space-y-2'>
+                        <Label className='text-[10px]'>Fill Type</Label>
+                        <Select
+                          value={fillMode}
+                          onValueChange={(value) => {
+                            if (!selectedId || !selectedElement) return;
+                            if (value === 'solid') {
+                              updateElement(selectedId, { fillGradient: undefined });
+                              return;
+                            }
+                            const nextStops = selectedElement.fillGradient?.stops?.length
+                              ? selectedElement.fillGradient.stops
+                              : defaultGradientStops(selectedElement.fill || '#e2e8f0');
+                            updateElement(selectedId, {
+                              fillGradient: {
+                                type: value as 'linear' | 'radial',
+                                angle:
+                                  value === 'linear'
+                                    ? (selectedElement.fillGradient?.angle ?? 0)
+                                    : undefined,
+                                stops: nextStops
+                              }
+                            });
+                          }}
+                        >
+                          <SelectTrigger className='h-8 text-xs'>
+                            <SelectValue />
+                          </SelectTrigger>
+                          <SelectContent>
+                            <SelectItem value='solid'>Solid</SelectItem>
+                            <SelectItem value='linear'>Linear</SelectItem>
+                            <SelectItem value='radial'>Radial</SelectItem>
+                          </SelectContent>
+                        </Select>
                       </div>
+
+                      {fillMode === 'solid' ? (
+                        <div className='flex items-center gap-2'>
+                          <Input
+                            className='h-8 w-12 border-none bg-transparent p-1'
+                            type='color'
+                            value={selectedElement.fill}
+                            onChange={(e) => updateElement(selectedId!, { fill: e.target.value })}
+                          />
+                          <Input
+                            className='h-8 flex-1 text-xs'
+                            type='text'
+                            value={selectedElement.fill}
+                            onChange={(e) => updateElement(selectedId!, { fill: e.target.value })}
+                          />
+                          <div className='w-8 text-[10px] text-slate-400'>
+                            {Math.round(selectedElement.opacity * 100)}%
+                          </div>
+                        </div>
+                      ) : (
+                        <div className='space-y-3'>
+                          {fillMode === 'linear' && (
+                            <div className='flex items-center gap-2'>
+                              <Label className='w-10 text-[10px] text-slate-400'>Angle</Label>
+                              <Input
+                                className='h-8 text-xs'
+                                type='number'
+                                value={selectedElement.fillGradient?.angle ?? 0}
+                                onChange={(e) =>
+                                  updateFillGradient((current) => ({
+                                    ...current,
+                                    angle: Number(e.target.value)
+                                  }))
+                                }
+                              />
+                            </div>
+                          )}
+                          <div className='grid grid-cols-2 gap-3'>
+                            <div className='space-y-1'>
+                              <Label className='text-[10px]'>Start</Label>
+                              <div className='flex items-center gap-2'>
+                                <Input
+                                  className='h-8 w-12 border-none bg-transparent p-1'
+                                  type='color'
+                                  value={gradientStops[0]?.color || '#000000'}
+                                  onChange={(e) =>
+                                    updateFillGradient((current) => {
+                                      const stops =
+                                        current.stops.length > 0
+                                          ? current.stops
+                                          : defaultGradientStops(selectedElement.fill || '#e2e8f0');
+                                      const nextStops = stops.map((stop, index) =>
+                                        index === 0 ? { ...stop, color: e.target.value } : stop
+                                      );
+                                      return { ...current, stops: nextStops };
+                                    })
+                                  }
+                                />
+                                <Input
+                                  className='h-8 flex-1 text-xs'
+                                  type='text'
+                                  value={gradientStops[0]?.color || '#000000'}
+                                  onChange={(e) =>
+                                    updateFillGradient((current) => {
+                                      const stops =
+                                        current.stops.length > 0
+                                          ? current.stops
+                                          : defaultGradientStops(selectedElement.fill || '#e2e8f0');
+                                      const nextStops = stops.map((stop, index) =>
+                                        index === 0 ? { ...stop, color: e.target.value } : stop
+                                      );
+                                      return { ...current, stops: nextStops };
+                                    })
+                                  }
+                                />
+                              </div>
+                            </div>
+                            <div className='space-y-1'>
+                              <Label className='text-[10px]'>End</Label>
+                              <div className='flex items-center gap-2'>
+                                <Input
+                                  className='h-8 w-12 border-none bg-transparent p-1'
+                                  type='color'
+                                  value={gradientStops[1]?.color || '#ffffff'}
+                                  onChange={(e) =>
+                                    updateFillGradient((current) => {
+                                      const stops =
+                                        current.stops.length > 1
+                                          ? current.stops
+                                          : defaultGradientStops(selectedElement.fill || '#e2e8f0');
+                                      const nextStops = stops.map((stop, index) =>
+                                        index === 1 ? { ...stop, color: e.target.value } : stop
+                                      );
+                                      return { ...current, stops: nextStops };
+                                    })
+                                  }
+                                />
+                                <Input
+                                  className='h-8 flex-1 text-xs'
+                                  type='text'
+                                  value={gradientStops[1]?.color || '#ffffff'}
+                                  onChange={(e) =>
+                                    updateFillGradient((current) => {
+                                      const stops =
+                                        current.stops.length > 1
+                                          ? current.stops
+                                          : defaultGradientStops(selectedElement.fill || '#e2e8f0');
+                                      const nextStops = stops.map((stop, index) =>
+                                        index === 1 ? { ...stop, color: e.target.value } : stop
+                                      );
+                                      return { ...current, stops: nextStops };
+                                    })
+                                  }
+                                />
+                              </div>
+                            </div>
+                          </div>
+                          <div className='text-[10px] text-slate-400'>
+                            {Math.round(selectedElement.opacity * 100)}%
+                          </div>
+                        </div>
+                      )}
                       {selectedElement.type === 'image' && (
                         <div className='space-y-2 pt-2'>
                           <Label className='text-[10px]'>Image Fit</Label>
@@ -2417,14 +2415,6 @@ const FigmaLite = () => {
                     <Separator />
 
                     <div className='space-y-2 pt-2'>
-                      <Button
-                        className='w-full border-purple-200 text-purple-600 hover:bg-purple-50'
-                        size='sm'
-                        variant='outline'
-                        onClick={createMaster}
-                      >
-                        <ComponentIcon className='mr-2 h-3.5 w-3.5' /> Create Component
-                      </Button>
                       <Button
                         className='w-full text-red-500 hover:bg-red-50 hover:text-red-600'
                         size='sm'
