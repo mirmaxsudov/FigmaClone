@@ -9,6 +9,46 @@ export interface Constraints {
 export type ElementType = 'circle' | 'frame' | 'group' | 'image' | 'instance' | 'rect' | 'text';
 export type ResizeHandle = 'e' | 'n' | 'ne' | 'nw' | 's' | 'se' | 'sw' | 'w';
 
+export type EffectType = 'backgroundBlur' | 'dropShadow' | 'innerShadow' | 'layerBlur';
+
+export interface EffectBase {
+  enabled: boolean;
+  id: string;
+  type: EffectType;
+}
+
+export interface DropShadowEffect extends EffectBase {
+  blur: number;
+  color: string;
+  offsetX: number;
+  offsetY: number;
+  opacity: number;
+  spread: number;
+  type: 'dropShadow';
+}
+
+export interface InnerShadowEffect extends EffectBase {
+  blur: number;
+  color: string;
+  offsetX: number;
+  offsetY: number;
+  opacity: number;
+  spread: number;
+  type: 'innerShadow';
+}
+
+export interface LayerBlurEffect extends EffectBase {
+  radius: number;
+  type: 'layerBlur';
+}
+
+export interface BackgroundBlurEffect extends EffectBase {
+  radius: number;
+  type: 'backgroundBlur';
+}
+
+export type Effect = BackgroundBlurEffect | DropShadowEffect | InnerShadowEffect | LayerBlurEffect;
+
 export interface GradientStop {
   color: string;
   offset: number;
@@ -24,6 +64,7 @@ export interface GradientFill {
 export interface Element {
   children?: Element[];
   constraints: Constraints;
+  effects?: Effect[];
   fill: string;
   fillGradient?: GradientFill;
   fontFamily?: string;

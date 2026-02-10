@@ -35,8 +35,11 @@ import {
 import { Separator } from '@/components/ui/separator.tsx';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs.tsx';
 
+import type { SmartGuideState, SpatialIndex, WorldBounds } from './smartGuides';
 import type {
   DuplicateResult,
+  Effect,
+  EffectType,
   Element,
   ElementType,
   GradientFill,
@@ -48,6 +51,15 @@ import type {
 } from './types';
 
 import { LayerItem } from './LayerItem';
+import {
+  buildSpatialIndex,
+  collectBoundsById,
+  collectWorldBounds,
+  computeAlignmentGuides,
+  computeMeasurements,
+  getRotatedBounds,
+  unionBounds
+} from './smartGuides';
 import {
   clampZoom,
   cloneElement,
@@ -64,16 +76,6 @@ import {
   getTopLevelSelection,
   updateElementInList
 } from './utils';
-import {
-  buildSpatialIndex,
-  collectBoundsById,
-  collectWorldBounds,
-  computeAlignmentGuides,
-  computeMeasurements,
-  getRotatedBounds,
-  unionBounds
-} from './smartGuides';
-import type { SmartGuideState, SpatialIndex, WorldBounds } from './smartGuides';
 
 const GRID_SIZE = 24;
 const HANDLE_SIZE = 8;
@@ -82,6 +84,59 @@ const SMART_GUIDE_SNAP = 4;
 const SMART_GUIDE_CELL = 240;
 const SMART_GUIDE_SEARCH_PADDING = 80;
 const SMART_GUIDE_VIEWPORT_PADDING = 200;
+
+const EFFECT_LABELS: Record<EffectType, string> = {
+  dropShadow: 'Drop Shadow',
+  innerShadow: 'Inner Shadow',
+  layerBlur: 'Layer Blur',
+  backgroundBlur: 'Background Blur'
+};
+
+const zoomBucketFor = (value: number) => Math.max(0.1, Math.round(value * 10) / 10);
+
+const serializeElementForEffects = (el: Element): unknown => ({
+  type: el.type,
+  width: el.width,
+  height: el.height,
+  fill: el.fill,
+  fillGradient: el.fillGradient,
+  stroke: el.stroke,
+  strokeWidth: el.strokeWidth,
+  opacity: el.opacity,
+  imageSrc: el.imageSrc,
+  imageFit: el.imageFit,
+  text: el.text,
+  fontSize: el.fontSize,
+  fontFamily: el.fontFamily,
+  fontWeight: el.fontWeight,
+  textAlign: el.textAlign,
+  lineHeight: el.lineHeight,
+  rotation: el.rotation ?? 0,
+  effects: el.effects ?? [],
+  children: el.children ? el.children.map((child) => serializeElementForEffects(child)) : undefined
+});
+
+const colorWithOpacity = (value: string, opacity: number) => {
+  if (opacity >= 1) return value;
+  if (!value.startsWith('#')) {
+    return value;
+  }
+  const hex = value.replace('#', '').trim();
+  if (hex.length !== 3 && hex.length !== 6) return value;
+  const normalized =
+    hex.length === 3
+      ? hex
+          .split('')
+          .map((c) => c + c)
+          .join('')
+      : hex;
+  const num = Number.parseInt(normalized, 16);
+  if (Number.isNaN(num)) return value;
+  const r = (num >> 16) & 255;
+  const g = (num >> 8) & 255;
+  const b = num & 255;
+  return `rgba(${r}, ${g}, ${b}, ${opacity})`;
+};
 
 const FigmaLite = () => {
   const [elements, setElements] = useState<Element[]>(() => {
@@ -353,11 +408,13 @@ const FigmaLite = () => {
   const [isAltPressed, setIsAltPressed] = useState(false);
   const [selectionBox, setSelectionBox] = useState<SelectionRect | null>(null);
   const [smartGuides, setSmartGuides] = useState<SmartGuideState | null>(null);
+  const [effectTypeDraft, setEffectTypeDraft] = useState<EffectType>('dropShadow');
 
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const imageInputRef = useRef<HTMLInputElement>(null);
   const imageTargetRef = useRef<{ mode: 'new' | 'replace'; id?: string }>({ mode: 'new' });
   const imageCacheRef = useRef<Map<string, HTMLImageElement>>(new Map());
+  const effectCacheRef = useRef<Map<string, HTMLCanvasElement>>(new Map());
   const rafRef = useRef<number | null>(null);
   const pendingUpdateRef = useRef<Array<{ id: string; updates: Partial<Element> }> | null>(null);
   const historyRef = useRef<HistoryState[]>([]);
@@ -574,6 +631,98 @@ const FigmaLite = () => {
       updateElement(selectedId, { fillGradient: updater(base) });
     },
     [selectedElement, selectedId, updateElement]
+  );
+
+  const createEffect = useCallback((type: EffectType): Effect => {
+    const base = { id: generateId(), enabled: true };
+    if (type === 'dropShadow') {
+      return {
+        ...base,
+        type,
+        color: '#0f172a',
+        opacity: 0.25,
+        blur: 8,
+        spread: 0,
+        offsetX: 0,
+        offsetY: 4
+      };
+    }
+    if (type === 'innerShadow') {
+      return {
+        ...base,
+        type,
+        color: '#0f172a',
+        opacity: 0.2,
+        blur: 6,
+        spread: 0,
+        offsetX: 0,
+        offsetY: 2
+      };
+    }
+    if (type === 'backgroundBlur') {
+      return {
+        ...base,
+        type,
+        radius: 8
+      };
+    }
+    return {
+      ...base,
+      type: 'layerBlur',
+      radius: 6
+    };
+  }, []);
+
+  const updateEffectStack = useCallback(
+    (next: Effect[]) => {
+      if (!selectedId) return;
+      updateElement(selectedId, { effects: next });
+    },
+    [selectedId, updateElement]
+  );
+
+  const addEffect = useCallback(
+    (type: EffectType) => {
+      if (!selectedId) return;
+      const next = [...(selectedElement?.effects ?? []), createEffect(type)];
+      updateEffectStack(next);
+    },
+    [createEffect, selectedElement, selectedId, updateEffectStack]
+  );
+
+  const updateEffect = useCallback(
+    <T extends Effect>(effect: T, updates: Partial<T>) => {
+      if (!selectedId) return;
+      const next = (selectedElement?.effects ?? []).map((item) =>
+        item.id === effect.id ? { ...effect, ...updates } : item
+      );
+      updateEffectStack(next);
+    },
+    [selectedElement, selectedId, updateEffectStack]
+  );
+
+  const removeEffect = useCallback(
+    (effectId: string) => {
+      if (!selectedId) return;
+      const next = (selectedElement?.effects ?? []).filter((effect) => effect.id !== effectId);
+      updateEffectStack(next);
+    },
+    [selectedElement, selectedId, updateEffectStack]
+  );
+
+  const moveEffect = useCallback(
+    (effectId: string, direction: 'down' | 'up') => {
+      if (!selectedId) return;
+      const effects = [...(selectedElement?.effects ?? [])];
+      const index = effects.findIndex((effect) => effect.id === effectId);
+      if (index < 0) return;
+      const nextIndex = direction === 'up' ? index - 1 : index + 1;
+      if (nextIndex < 0 || nextIndex >= effects.length) return;
+      const [item] = effects.splice(index, 1);
+      effects.splice(nextIndex, 0, item);
+      updateEffectStack(effects);
+    },
+    [selectedElement, selectedId, updateEffectStack]
   );
 
   const deleteSelected = () => {
@@ -1254,7 +1403,10 @@ const FigmaLite = () => {
         if (measureMode) {
           const measureRange = Math.max(state.guideViewport.width, state.guideViewport.height);
           const candidates = state.guideIndex.query(movingBounds, measureRange);
-          setSmartGuides({ lines: [], measurements: computeMeasurements(movingBounds, candidates) });
+          setSmartGuides({
+            lines: [],
+            measurements: computeMeasurements(movingBounds, candidates)
+          });
         } else {
           const candidates = state.guideIndex.query(movingBounds, SMART_GUIDE_SEARCH_PADDING);
           const alignment = computeAlignmentGuides({
@@ -1416,7 +1568,10 @@ const FigmaLite = () => {
         if (measureMode) {
           const measureRange = Math.max(state.guideViewport.width, state.guideViewport.height);
           const candidates = state.guideIndex.query(movingBounds, measureRange);
-          setSmartGuides({ lines: [], measurements: computeMeasurements(movingBounds, candidates) });
+          setSmartGuides({
+            lines: [],
+            measurements: computeMeasurements(movingBounds, candidates)
+          });
         } else {
           let allowedX: Array<'center' | 'left' | 'right'> = [];
           let allowedY: Array<'bottom' | 'centerY' | 'top'> = [];
@@ -1624,6 +1779,8 @@ const FigmaLite = () => {
 
     const gradientDefs: string[] = [];
     const gradientIds = new Map<string, string>();
+    const effectDefs: string[] = [];
+    const effectIds = new Map<string, string>();
 
     const buildGradientDef = (el: Element, id: string) => {
       if (!el.fillGradient) return '';
@@ -1671,12 +1828,76 @@ const FigmaLite = () => {
       }
     };
 
+    const buildEffectDef = (el: Element, id: string) => {
+      const effects = (el.effects || []).filter((effect) => effect.enabled);
+      if (effects.length === 0) return '';
+      let markup = `<filter id="${id}" x="-50%" y="-50%" width="200%" height="200%" color-interpolation-filters="sRGB">`;
+      let current = 'SourceGraphic';
+
+      effects.forEach((effect, index) => {
+        const result = `${id}-fx-${index}`;
+        if (effect.type === 'dropShadow') {
+          markup += `<feDropShadow in="${current}" dx="${effect.offsetX}" dy="${effect.offsetY}" stdDeviation="${effect.blur}" flood-color="${effect.color}" flood-opacity="${effect.opacity}" result="${result}" />`;
+          current = result;
+          return;
+        }
+        if (effect.type === 'layerBlur') {
+          markup += `<feGaussianBlur in="${current}" stdDeviation="${effect.radius}" result="${result}" />`;
+          current = result;
+          return;
+        }
+        if (effect.type === 'backgroundBlur') {
+          const blurId = `${id}-bg-blur-${index}`;
+          const maskId = `${id}-bg-mask-${index}`;
+          markup += `<feGaussianBlur in="BackgroundImage" stdDeviation="${effect.radius}" result="${blurId}" />`;
+          markup += `<feComposite in="${blurId}" in2="SourceAlpha" operator="in" result="${maskId}" />`;
+          markup += `<feComposite in="${maskId}" in2="${current}" operator="over" result="${result}" />`;
+          current = result;
+          return;
+        }
+        const offsetId = `${id}-in-offset-${index}`;
+        const blurId = `${id}-in-blur-${index}`;
+        const outId = `${id}-in-out-${index}`;
+        const colorId = `${id}-in-color-${index}`;
+        const shadowId = `${id}-in-shadow-${index}`;
+        markup += `<feOffset in="${current}" dx="${effect.offsetX}" dy="${effect.offsetY}" result="${offsetId}" />`;
+        markup += `<feGaussianBlur in="${offsetId}" stdDeviation="${effect.blur}" result="${blurId}" />`;
+        markup += `<feComposite in="${blurId}" in2="${current}" operator="out" result="${outId}" />`;
+        markup += `<feFlood flood-color="${effect.color}" flood-opacity="${effect.opacity}" result="${colorId}" />`;
+        markup += `<feComposite in="${colorId}" in2="${outId}" operator="in" result="${shadowId}" />`;
+        markup += `<feComposite in="${shadowId}" in2="${current}" operator="over" result="${result}" />`;
+        current = result;
+      });
+
+      markup += `</filter>`;
+      return markup;
+    };
+
+    const collectEffects = (list: Element[]) => {
+      for (const el of list) {
+        const hasEffects = el.effects && el.effects.some((effect) => effect.enabled);
+        if (hasEffects) {
+          const id = `fx-${el.id}`;
+          if (!effectIds.has(el.id)) {
+            effectIds.set(el.id, id);
+            const def = buildEffectDef(el, id);
+            if (def) effectDefs.push(def);
+          }
+        }
+        if (el.children) {
+          collectEffects(el.children);
+        }
+      }
+    };
+
     collectGradients([frame]);
+    collectEffects([frame]);
 
     const renderSVGElement = (el: Element): string => {
       let content = '';
       const fill =
         el.fillGradient && gradientIds.has(el.id) ? `url(#${gradientIds.get(el.id)})` : el.fill;
+      const filterId = effectIds.get(el.id);
       if (el.type === 'group') {
         // groups are visual containers only
       } else if (el.type === 'rect' || el.type === 'frame' || el.type === 'instance') {
@@ -1717,10 +1938,16 @@ const FigmaLite = () => {
         content += el.children.map(renderSVGElement).join('');
         content += `</g>`;
       }
+      if (filterId) {
+        content = `<g filter="url(#${filterId})">${content}</g>`;
+      }
       return content;
     };
 
-    const defs = gradientDefs.length > 0 ? `<defs>${gradientDefs.join('')}</defs>` : '';
+    const defs =
+      gradientDefs.length > 0 || effectDefs.length > 0
+        ? `<defs>${gradientDefs.join('')}${effectDefs.join('')}</defs>`
+        : '';
     const svg = `<svg width="${frame.width}" height="${frame.height}" viewBox="0 0 ${frame.width} ${frame.height}" xmlns="http://www.w3.org/2000/svg">${defs}${renderSVGElement(
       {
         ...frame,
@@ -1782,47 +2009,50 @@ const FigmaLite = () => {
       }
     }
 
-    const drawElement = (el: Element, offsetX: number, offsetY: number) => {
+    const renderElementBase = (
+      targetCtx: CanvasRenderingContext2D,
+      el: Element,
+      offsetX: number,
+      offsetY: number
+    ) => {
       const x = offsetX + el.x;
       const y = offsetY + el.y;
-      const isFrame = el.type === 'frame';
-      const isSelected = selectedIds.includes(el.id);
 
-      ctx.save();
-      ctx.globalAlpha = el.opacity;
+      targetCtx.save();
+      targetCtx.globalAlpha = el.opacity;
 
       if (el.type === 'rect' || el.type === 'frame' || el.type === 'instance') {
-        const fillPaint = getCanvasFill(ctx, el, x, y);
+        const fillPaint = getCanvasFill(targetCtx, el, x, y);
         if (fillPaint) {
-          ctx.fillStyle = fillPaint;
-          ctx.fillRect(x, y, el.width, el.height);
+          targetCtx.fillStyle = fillPaint;
+          targetCtx.fillRect(x, y, el.width, el.height);
         }
         if (el.strokeWidth > 0 && el.stroke) {
-          ctx.strokeStyle = el.stroke;
-          ctx.lineWidth = el.strokeWidth;
-          ctx.strokeRect(x, y, el.width, el.height);
+          targetCtx.strokeStyle = el.stroke;
+          targetCtx.lineWidth = el.strokeWidth;
+          targetCtx.strokeRect(x, y, el.width, el.height);
         }
       } else if (el.type === 'circle') {
         const radius = el.width / 2;
         const cx = x + radius;
         const cy = y + radius;
-        ctx.beginPath();
-        ctx.arc(cx, cy, radius, 0, Math.PI * 2);
-        const fillPaint = getCanvasFill(ctx, el, x, y);
+        targetCtx.beginPath();
+        targetCtx.arc(cx, cy, radius, 0, Math.PI * 2);
+        const fillPaint = getCanvasFill(targetCtx, el, x, y);
         if (fillPaint) {
-          ctx.fillStyle = fillPaint;
-          ctx.fill();
+          targetCtx.fillStyle = fillPaint;
+          targetCtx.fill();
         }
         if (el.strokeWidth > 0 && el.stroke) {
-          ctx.strokeStyle = el.stroke;
-          ctx.lineWidth = el.strokeWidth;
-          ctx.stroke();
+          targetCtx.strokeStyle = el.stroke;
+          targetCtx.lineWidth = el.strokeWidth;
+          targetCtx.stroke();
         }
       } else if (el.type === 'image') {
-        ctx.save();
-        ctx.beginPath();
-        ctx.rect(x, y, el.width, el.height);
-        ctx.clip();
+        targetCtx.save();
+        targetCtx.beginPath();
+        targetCtx.rect(x, y, el.width, el.height);
+        targetCtx.clip();
 
         const src = el.imageSrc;
         if (src) {
@@ -1840,7 +2070,7 @@ const FigmaLite = () => {
           if (image.complete && image.naturalWidth > 0) {
             const fit = el.imageFit || 'contain';
             if (fit === 'fill') {
-              ctx.drawImage(image, x, y, el.width, el.height);
+              targetCtx.drawImage(image, x, y, el.width, el.height);
             } else {
               const scale =
                 fit === 'cover'
@@ -1850,22 +2080,22 @@ const FigmaLite = () => {
               const drawH = image.naturalHeight * scale;
               const drawX = x + (el.width - drawW) / 2;
               const drawY = y + (el.height - drawH) / 2;
-              ctx.drawImage(image, drawX, drawY, drawW, drawH);
+              targetCtx.drawImage(image, drawX, drawY, drawW, drawH);
             }
           } else {
-            ctx.fillStyle = '#e2e8f0';
-            ctx.fillRect(x, y, el.width, el.height);
+            targetCtx.fillStyle = '#e2e8f0';
+            targetCtx.fillRect(x, y, el.width, el.height);
           }
         } else {
-          ctx.fillStyle = '#e2e8f0';
-          ctx.fillRect(x, y, el.width, el.height);
+          targetCtx.fillStyle = '#e2e8f0';
+          targetCtx.fillRect(x, y, el.width, el.height);
         }
-        ctx.restore();
+        targetCtx.restore();
 
         if (el.strokeWidth > 0 && el.stroke) {
-          ctx.strokeStyle = el.stroke;
-          ctx.lineWidth = el.strokeWidth;
-          ctx.strokeRect(x, y, el.width, el.height);
+          targetCtx.strokeStyle = el.stroke;
+          targetCtx.lineWidth = el.strokeWidth;
+          targetCtx.strokeRect(x, y, el.width, el.height);
         }
       } else if (el.type === 'text') {
         const fontSize = el.fontSize || 16;
@@ -1875,107 +2105,297 @@ const FigmaLite = () => {
         const lineHeight = (el.lineHeight || 1.2) * fontSize;
         const lines = (el.text || '').split('\n');
 
-        const fillPaint = getCanvasFill(ctx, el, x, y);
-        ctx.fillStyle = fillPaint || el.fill || '#000000';
-        ctx.font = `${fontWeight} ${fontSize}px ${fontFamily}`;
-        ctx.textAlign = align;
-        ctx.textBaseline = 'middle';
+        const fillPaint = getCanvasFill(targetCtx, el, x, y);
+        targetCtx.fillStyle = fillPaint || el.fill || '#000000';
+        targetCtx.font = `${fontWeight} ${fontSize}px ${fontFamily}`;
+        targetCtx.textAlign = align;
+        targetCtx.textBaseline = 'middle';
 
         const textX = align === 'left' ? x : align === 'right' ? x + el.width : x + el.width / 2;
         const totalHeight = lineHeight * lines.length;
         const startY = y + el.height / 2 - totalHeight / 2 + lineHeight / 2;
 
         lines.forEach((line, index) => {
-          ctx.fillText(line, textX, startY + index * lineHeight);
+          targetCtx.fillText(line, textX, startY + index * lineHeight);
         });
       }
-      ctx.restore();
+      targetCtx.restore();
+    };
 
-      if (isFrame) {
-        ctx.save();
-        ctx.beginPath();
-        ctx.rect(x, y, el.width, el.height);
-        ctx.clip();
-        if (el.children) {
-          for (const child of el.children) {
-            drawElement(child, x, y);
-          }
-        }
-        ctx.restore();
-      } else if (el.children) {
-        for (const child of el.children) {
-          drawElement(child, x, y);
-        }
-      }
-
-      if (isFrame) {
-        ctx.save();
-        const labelText = el.name.toUpperCase();
-        ctx.font = '8px ui-sans-serif, system-ui, -apple-system';
-        const paddingX = 4;
-        const paddingY = 2;
+    const drawSelectionOverlay = (el: Element, x: number, y: number) => {
+      ctx.save();
+      ctx.strokeStyle = '#3b82f6';
+      ctx.lineWidth = 2 / zoom;
+      ctx.strokeRect(x - 1, y - 1, el.width + 2, el.height + 2);
+      if (selectedIds.length === 1) {
+        const labelText = `${Math.round(el.width)} x ${Math.round(el.height)}`;
+        const fontSize = 9 / zoom;
+        const paddingX = 4 / zoom;
+        const paddingY = 2 / zoom;
+        ctx.font = `${fontSize}px ui-sans-serif, system-ui, -apple-system`;
         const metrics = ctx.measureText(labelText);
         const labelWidth = metrics.width + paddingX * 2;
-        const labelHeight = 12;
-        ctx.fillStyle = 'rgba(241, 245, 249, 0.9)';
-        ctx.fillRect(x, y, labelWidth, labelHeight);
-        ctx.fillStyle = '#94a3b8';
+        const labelHeight = fontSize + paddingY * 2;
+        const gap = 6 / zoom;
+        const labelX = x;
+        const labelY = y - labelHeight - gap;
+        ctx.fillStyle = 'rgba(15, 23, 42, 0.85)';
+        ctx.fillRect(labelX, labelY, labelWidth, labelHeight);
+        ctx.fillStyle = '#ffffff';
         ctx.textAlign = 'left';
         ctx.textBaseline = 'top';
-        ctx.fillText(labelText, x + paddingX, y + paddingY);
-        ctx.restore();
+        ctx.fillText(labelText, labelX + paddingX, labelY + paddingY);
+
+        const handleSize = HANDLE_SIZE / zoom;
+        const half = handleSize / 2;
+        const handles: Array<{ x: number; y: number }> = [
+          { x, y },
+          { x: x + el.width / 2, y },
+          { x: x + el.width, y },
+          { x: x + el.width, y: y + el.height / 2 },
+          { x: x + el.width, y: y + el.height },
+          { x: x + el.width / 2, y: y + el.height },
+          { x, y: y + el.height },
+          { x, y: y + el.height / 2 }
+        ];
+        ctx.fillStyle = '#ffffff';
+        ctx.strokeStyle = '#3b82f6';
+        ctx.lineWidth = 1 / zoom;
+        for (const handle of handles) {
+          ctx.fillRect(handle.x - half, handle.y - half, handleSize, handleSize);
+          ctx.strokeRect(handle.x - half, handle.y - half, handleSize, handleSize);
+        }
+      }
+      ctx.restore();
+    };
+
+    const drawFrameLabel = (el: Element, x: number, y: number) => {
+      if (el.type !== 'frame') return;
+      ctx.save();
+      const labelText = el.name.toUpperCase();
+      ctx.font = '8px ui-sans-serif, system-ui, -apple-system';
+      const paddingX = 4;
+      const paddingY = 2;
+      const metrics = ctx.measureText(labelText);
+      const labelWidth = metrics.width + paddingX * 2;
+      const labelHeight = 12;
+      ctx.fillStyle = 'rgba(241, 245, 249, 0.9)';
+      ctx.fillRect(x, y, labelWidth, labelHeight);
+      ctx.fillStyle = '#94a3b8';
+      ctx.textAlign = 'left';
+      ctx.textBaseline = 'top';
+      ctx.fillText(labelText, x + paddingX, y + paddingY);
+      ctx.restore();
+    };
+
+    const applyBackgroundBlur = (
+      el: Element,
+      bounds: { x: number; y: number; width: number; height: number },
+      radius: number
+    ) => {
+      if (radius <= 0) return;
+      const canvasEl = ctx.canvas;
+      const dpr = window.devicePixelRatio || 1;
+      const screenX = bounds.x * zoom + pan.x;
+      const screenY = bounds.y * zoom + pan.y;
+      const screenW = bounds.width * zoom;
+      const screenH = bounds.height * zoom;
+      if (screenW <= 0 || screenH <= 0) return;
+
+      const srcCanvas = document.createElement('canvas');
+      srcCanvas.width = Math.ceil(screenW * dpr);
+      srcCanvas.height = Math.ceil(screenH * dpr);
+      const srcCtx = srcCanvas.getContext('2d');
+      if (!srcCtx) return;
+      srcCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      srcCtx.drawImage(canvasEl, screenX, screenY, screenW, screenH, 0, 0, screenW, screenH);
+
+      const blurCanvas = document.createElement('canvas');
+      blurCanvas.width = srcCanvas.width;
+      blurCanvas.height = srcCanvas.height;
+      const blurCtx = blurCanvas.getContext('2d');
+      if (!blurCtx) return;
+      blurCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      blurCtx.filter = `blur(${radius * zoom}px)`;
+      blurCtx.drawImage(srcCanvas, 0, 0, screenW, screenH);
+      blurCtx.filter = 'none';
+
+      ctx.save();
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      ctx.beginPath();
+      if (el.type === 'circle') {
+        const cx = (bounds.x + bounds.width / 2) * zoom + pan.x;
+        const cy = (bounds.y + bounds.height / 2) * zoom + pan.y;
+        const r = (bounds.width / 2) * zoom;
+        ctx.arc(cx, cy, r, 0, Math.PI * 2);
+      } else {
+        ctx.rect(screenX, screenY, screenW, screenH);
+      }
+      ctx.clip();
+      ctx.drawImage(
+        blurCanvas,
+        0,
+        0,
+        blurCanvas.width,
+        blurCanvas.height,
+        screenX,
+        screenY,
+        screenW,
+        screenH
+      );
+      ctx.restore();
+    };
+
+    const renderElementWithEffects = (
+      targetCtx: CanvasRenderingContext2D,
+      el: Element,
+      offsetX: number,
+      offsetY: number,
+      allowBackgroundBlur: boolean
+    ) => {
+      const effects = (el.effects || []).filter((effect) => effect.enabled);
+      if (effects.length === 0) {
+        renderElementBase(targetCtx, el, offsetX, offsetY);
+        return;
       }
 
-      if (isSelected) {
-        ctx.save();
-        ctx.strokeStyle = '#3b82f6';
-        ctx.lineWidth = 2 / zoom;
-        ctx.strokeRect(x - 1, y - 1, el.width + 2, el.height + 2);
-        if (selectedIds.length === 1) {
-          const labelText = `${Math.round(el.width)} x ${Math.round(el.height)}`;
-          const fontSize = 9 / zoom;
-          const paddingX = 4 / zoom;
-          const paddingY = 2 / zoom;
-          ctx.font = `${fontSize}px ui-sans-serif, system-ui, -apple-system`;
-          const metrics = ctx.measureText(labelText);
-          const labelWidth = metrics.width + paddingX * 2;
-          const labelHeight = fontSize + paddingY * 2;
-          const gap = 6 / zoom;
-          const labelX = x;
-          const labelY = y - labelHeight - gap;
-          ctx.fillStyle = 'rgba(15, 23, 42, 0.85)';
-          ctx.fillRect(labelX, labelY, labelWidth, labelHeight);
-          ctx.fillStyle = '#ffffff';
-          ctx.textAlign = 'left';
-          ctx.textBaseline = 'top';
-          ctx.fillText(labelText, labelX + paddingX, labelY + paddingY);
+      const x = offsetX + el.x;
+      const y = offsetY + el.y;
+      const hasBackgroundBlur = effects.some((effect) => effect.type === 'backgroundBlur');
+      const pad = effects.reduce((acc, effect) => {
+        if (effect.type === 'layerBlur') {
+          return Math.max(acc, effect.radius * 2);
+        }
+        if (effect.type === 'dropShadow' || effect.type === 'innerShadow') {
+          const blur = effect.blur + effect.spread;
+          const extent = blur + Math.max(Math.abs(effect.offsetX), Math.abs(effect.offsetY));
+          return Math.max(acc, extent);
+        }
+        return acc;
+      }, 0);
+      const padding = Math.ceil(pad + 4);
 
-          const handleSize = HANDLE_SIZE / zoom;
-          const half = handleSize / 2;
-          const handles: Array<{ x: number; y: number }> = [
-            { x, y },
-            { x: x + el.width / 2, y },
-            { x: x + el.width, y },
-            { x: x + el.width, y: y + el.height / 2 },
-            { x: x + el.width, y: y + el.height },
-            { x: x + el.width / 2, y: y + el.height },
-            { x, y: y + el.height },
-            { x, y: y + el.height / 2 }
-          ];
-          ctx.fillStyle = '#ffffff';
-          ctx.strokeStyle = '#3b82f6';
-          ctx.lineWidth = 1 / zoom;
-          for (const handle of handles) {
-            ctx.fillRect(handle.x - half, handle.y - half, handleSize, handleSize);
-            ctx.strokeRect(handle.x - half, handle.y - half, handleSize, handleSize);
+      const zoomBucket = zoomBucketFor(zoom);
+      const styleHash = JSON.stringify(serializeElementForEffects(el));
+      const cacheKey = `${el.id}:${zoomBucket}:${styleHash}`;
+      if (allowBackgroundBlur && !hasBackgroundBlur) {
+        const cached = effectCacheRef.current.get(cacheKey);
+        if (cached) {
+          targetCtx.drawImage(cached, x - padding, y - padding);
+          return;
+        }
+      }
+
+      const width = Math.ceil(el.width + padding * 2);
+      const height = Math.ceil(el.height + padding * 2);
+      let current = document.createElement('canvas');
+      current.width = width;
+      current.height = height;
+      const baseCtx = current.getContext('2d');
+      if (!baseCtx) return;
+      renderElementBase(baseCtx, el, padding - el.x, padding - el.y);
+
+      for (const effect of effects) {
+        if (effect.type === 'backgroundBlur') {
+          if (allowBackgroundBlur) {
+            const bounds = getRotatedBounds(x, y, el.width, el.height, el.rotation ?? 0);
+            applyBackgroundBlur(el, bounds, effect.radius);
+          }
+          continue;
+        }
+
+        const next = document.createElement('canvas');
+        next.width = width;
+        next.height = height;
+        const nextCtx = next.getContext('2d');
+        if (!nextCtx) continue;
+
+        if (effect.type === 'layerBlur') {
+          nextCtx.filter = `blur(${effect.radius}px)`;
+          nextCtx.drawImage(current, 0, 0);
+          nextCtx.filter = 'none';
+        } else if (effect.type === 'dropShadow') {
+          nextCtx.save();
+          nextCtx.shadowColor = colorWithOpacity(effect.color, effect.opacity);
+          nextCtx.shadowBlur = effect.blur + effect.spread;
+          nextCtx.shadowOffsetX = effect.offsetX;
+          nextCtx.shadowOffsetY = effect.offsetY;
+          nextCtx.drawImage(current, 0, 0);
+          nextCtx.restore();
+          nextCtx.drawImage(current, 0, 0);
+        } else if (effect.type === 'innerShadow') {
+          nextCtx.drawImage(current, 0, 0);
+          const shadowCanvas = document.createElement('canvas');
+          shadowCanvas.width = width;
+          shadowCanvas.height = height;
+          const shadowCtx = shadowCanvas.getContext('2d');
+          if (shadowCtx) {
+            shadowCtx.drawImage(current, 0, 0);
+            shadowCtx.globalCompositeOperation = 'source-in';
+            shadowCtx.shadowColor = colorWithOpacity(effect.color, effect.opacity);
+            shadowCtx.shadowBlur = effect.blur + effect.spread;
+            shadowCtx.shadowOffsetX = effect.offsetX;
+            shadowCtx.shadowOffsetY = effect.offsetY;
+            shadowCtx.fillStyle = 'rgba(0, 0, 0, 0.02)';
+            shadowCtx.fillRect(-width, -height, width * 3, height * 3);
+            shadowCtx.globalCompositeOperation = 'source-over';
+            nextCtx.drawImage(shadowCanvas, 0, 0);
           }
         }
-        ctx.restore();
+        current = next;
+      }
+
+      if (allowBackgroundBlur && !hasBackgroundBlur) {
+        effectCacheRef.current.set(cacheKey, current);
+      }
+      targetCtx.drawImage(current, x - padding, y - padding);
+    };
+
+    const renderElementTree = (
+      targetCtx: CanvasRenderingContext2D,
+      el: Element,
+      offsetX: number,
+      offsetY: number,
+      options: { allowBackgroundBlur: boolean; drawSelection: boolean }
+    ) => {
+      const x = offsetX + el.x;
+      const y = offsetY + el.y;
+      const hasEffects = el.effects && el.effects.some((effect) => effect.enabled);
+
+      if (hasEffects) {
+        renderElementWithEffects(targetCtx, el, offsetX, offsetY, options.allowBackgroundBlur);
+      } else {
+        renderElementBase(targetCtx, el, offsetX, offsetY);
+      }
+
+      if (el.children && el.children.length > 0) {
+        if (el.type === 'frame') {
+          targetCtx.save();
+          targetCtx.beginPath();
+          targetCtx.rect(x, y, el.width, el.height);
+          targetCtx.clip();
+          for (const child of el.children) {
+            renderElementTree(targetCtx, child, x, y, options);
+          }
+          targetCtx.restore();
+        } else {
+          for (const child of el.children) {
+            renderElementTree(targetCtx, child, x, y, options);
+          }
+        }
+      }
+
+      if (options.drawSelection && selectedIds.includes(el.id) && targetCtx === ctx) {
+        drawSelectionOverlay(el, x, y);
+      }
+
+      if (targetCtx === ctx) {
+        drawFrameLabel(el, x, y);
       }
     };
 
     for (const el of elements) {
-      drawElement(el, 0, 0);
+      renderElementTree(ctx, el, 0, 0, { allowBackgroundBlur: true, drawSelection: true });
     }
 
     if (smartGuides && (smartGuides.lines.length > 0 || smartGuides.measurements.length > 0)) {
@@ -2827,6 +3247,192 @@ const FigmaLite = () => {
                             onChange={(e) => updateElement(selectedId!, { text: e.target.value })}
                           />
                         </div>
+                      )}
+                    </div>
+
+                    <Separator />
+                    <div className='space-y-3'>
+                      <h3 className='text-[10px] font-bold text-slate-400 uppercase'>Effects</h3>
+                      <div className='flex items-center gap-2'>
+                        <Select
+                          value={effectTypeDraft}
+                          onValueChange={(value) => setEffectTypeDraft(value as EffectType)}
+                        >
+                          <SelectTrigger className='h-8 text-xs'>
+                            <SelectValue />
+                          </SelectTrigger>
+                          <SelectContent>
+                            <SelectItem value='dropShadow'>Drop Shadow</SelectItem>
+                            <SelectItem value='innerShadow'>Inner Shadow</SelectItem>
+                            <SelectItem value='layerBlur'>Layer Blur</SelectItem>
+                            <SelectItem value='backgroundBlur'>Background Blur</SelectItem>
+                          </SelectContent>
+                        </Select>
+                        <Button
+                          size='sm'
+                          variant='outline'
+                          onClick={() => addEffect(effectTypeDraft)}
+                        >
+                          Add
+                        </Button>
+                      </div>
+
+                      {selectedElement.effects && selectedElement.effects.length > 0 ? (
+                        <div className='space-y-3'>
+                          {(selectedElement.effects ?? []).map((effect, index) => (
+                            <div
+                              key={effect.id}
+                              className='space-y-2 rounded-md border border-slate-200 bg-white/60 p-2'
+                            >
+                              <div className='flex items-center justify-between gap-2'>
+                                <label className='flex items-center gap-2 text-xs font-semibold text-slate-600'>
+                                  <input
+                                    checked={effect.enabled}
+                                    className='h-3.5 w-3.5 rounded border-slate-300'
+                                    type='checkbox'
+                                    onChange={(e) =>
+                                      updateEffect(effect, { enabled: e.target.checked })
+                                    }
+                                  />
+                                  {EFFECT_LABELS[effect.type]}
+                                </label>
+                                <div className='flex items-center gap-1'>
+                                  <Button
+                                    disabled={index === 0}
+                                    size='icon'
+                                    variant='ghost'
+                                    onClick={() => moveEffect(effect.id, 'up')}
+                                  >
+                                    <ArrowUp className='h-3.5 w-3.5' />
+                                  </Button>
+                                  <Button
+                                    disabled={index === (selectedElement.effects?.length ?? 0) - 1}
+                                    size='icon'
+                                    variant='ghost'
+                                    onClick={() => moveEffect(effect.id, 'down')}
+                                  >
+                                    <ArrowDown className='h-3.5 w-3.5' />
+                                  </Button>
+                                  <Button
+                                    size='icon'
+                                    variant='ghost'
+                                    onClick={() => removeEffect(effect.id)}
+                                  >
+                                    <Minus className='h-3.5 w-3.5' />
+                                  </Button>
+                                </div>
+                              </div>
+
+                              {(effect.type === 'dropShadow' || effect.type === 'innerShadow') && (
+                                <>
+                                  <div className='grid grid-cols-2 gap-2'>
+                                    <div className='space-y-1'>
+                                      <Label className='text-[10px]'>X</Label>
+                                      <Input
+                                        className='h-7 px-2 text-xs'
+                                        type='number'
+                                        value={effect.offsetX}
+                                        onChange={(e) =>
+                                          updateEffect(effect, {
+                                            offsetX: Number(e.target.value)
+                                          })
+                                        }
+                                      />
+                                    </div>
+                                    <div className='space-y-1'>
+                                      <Label className='text-[10px]'>Y</Label>
+                                      <Input
+                                        className='h-7 px-2 text-xs'
+                                        type='number'
+                                        value={effect.offsetY}
+                                        onChange={(e) =>
+                                          updateEffect(effect, {
+                                            offsetY: Number(e.target.value)
+                                          })
+                                        }
+                                      />
+                                    </div>
+                                    <div className='space-y-1'>
+                                      <Label className='text-[10px]'>Blur</Label>
+                                      <Input
+                                        className='h-7 px-2 text-xs'
+                                        type='number'
+                                        value={effect.blur}
+                                        onChange={(e) =>
+                                          updateEffect(effect, {
+                                            blur: Number(e.target.value)
+                                          })
+                                        }
+                                      />
+                                    </div>
+                                    <div className='space-y-1'>
+                                      <Label className='text-[10px]'>Spread</Label>
+                                      <Input
+                                        className='h-7 px-2 text-xs'
+                                        type='number'
+                                        value={effect.spread}
+                                        onChange={(e) =>
+                                          updateEffect(effect, {
+                                            spread: Number(e.target.value)
+                                          })
+                                        }
+                                      />
+                                    </div>
+                                  </div>
+                                  <div className='flex items-center gap-2'>
+                                    <Input
+                                      className='h-7 w-10 border-none bg-transparent p-1'
+                                      type='color'
+                                      value={effect.color}
+                                      onChange={(e) =>
+                                        updateEffect(effect, { color: e.target.value })
+                                      }
+                                    />
+                                    <Input
+                                      className='h-7 flex-1 text-xs'
+                                      type='text'
+                                      value={effect.color}
+                                      onChange={(e) =>
+                                        updateEffect(effect, { color: e.target.value })
+                                      }
+                                    />
+                                    <Input
+                                      className='h-7 w-16 text-xs'
+                                      max={100}
+                                      min={0}
+                                      type='number'
+                                      value={Math.round(effect.opacity * 100)}
+                                      onChange={(e) =>
+                                        updateEffect(effect, {
+                                          opacity: Number(e.target.value) / 100
+                                        })
+                                      }
+                                    />
+                                  </div>
+                                </>
+                              )}
+
+                              {(effect.type === 'layerBlur' ||
+                                effect.type === 'backgroundBlur') && (
+                                <div className='space-y-1'>
+                                  <Label className='text-[10px]'>Radius</Label>
+                                  <Input
+                                    className='h-7 px-2 text-xs'
+                                    type='number'
+                                    value={effect.radius}
+                                    onChange={(e) =>
+                                      updateEffect(effect, {
+                                        radius: Number(e.target.value)
+                                      })
+                                    }
+                                  />
+                                </div>
+                              )}
+                            </div>
+                          ))}
+                        </div>
+                      ) : (
+                        <div className='text-[10px] text-slate-400'>No effects applied</div>
                       )}
                     </div>
 
