@@ -37,6 +37,7 @@ export interface Element {
   masterId?: string;
   name: string;
   opacity: number;
+  rotation?: number;
   stroke: string;
   strokeWidth: number;
   text?: string;

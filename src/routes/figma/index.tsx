@@ -64,10 +64,24 @@ import {
   getTopLevelSelection,
   updateElementInList
 } from './utils';
+import {
+  buildSpatialIndex,
+  collectBoundsById,
+  collectWorldBounds,
+  computeAlignmentGuides,
+  computeMeasurements,
+  getRotatedBounds,
+  unionBounds
+} from './smartGuides';
+import type { SmartGuideState, SpatialIndex, WorldBounds } from './smartGuides';
 
 const GRID_SIZE = 24;
 const HANDLE_SIZE = 8;
 const HISTORY_LIMIT = 100;
+const SMART_GUIDE_SNAP = 4;
+const SMART_GUIDE_CELL = 240;
+const SMART_GUIDE_SEARCH_PADDING = 80;
+const SMART_GUIDE_VIEWPORT_PADDING = 200;
 
 const FigmaLite = () => {
   const [elements, setElements] = useState<Element[]>(() => {
@@ -336,7 +350,9 @@ const FigmaLite = () => {
   const [hoverHandle, setHoverHandle] = useState<ResizeHandle | null>(null);
   const [activeHandle, setActiveHandle] = useState<ResizeHandle | null>(null);
   const [isSpacePressed, setIsSpacePressed] = useState(false);
+  const [isAltPressed, setIsAltPressed] = useState(false);
   const [selectionBox, setSelectionBox] = useState<SelectionRect | null>(null);
+  const [smartGuides, setSmartGuides] = useState<SmartGuideState | null>(null);
 
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const imageInputRef = useRef<HTMLInputElement>(null);
@@ -363,6 +379,9 @@ const FigmaLite = () => {
         startX: number;
         startY: number;
         hasHistory: boolean;
+        guideIndex?: SpatialIndex;
+        guideBounds?: Map<string, WorldBounds>;
+        guideViewport?: { x: number; y: number; width: number; height: number };
       }
     | {
         mode: 'pan';
@@ -383,6 +402,9 @@ const FigmaLite = () => {
         elH: number;
         aspect: number;
         hasHistory: boolean;
+        rotation?: number;
+        guideIndex?: SpatialIndex;
+        guideViewport?: { x: number; y: number; width: number; height: number };
       }
     | null
   >(null);
@@ -433,6 +455,7 @@ const FigmaLite = () => {
     setActiveHandle(null);
     setHoverHandle(null);
     setSelectionBox(null);
+    setSmartGuides(null);
     setElements(snapshot.elements);
     setMasters(snapshot.masters);
     setSelectedIds(snapshot.selectedIds);
@@ -979,6 +1002,28 @@ const FigmaLite = () => {
     [elements, pan.x, pan.y, selectedElement, selectedId, updateElement, zoom]
   );
 
+  const getViewportBounds = useCallback(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return { x: 0, y: 0, width: 0, height: 0 };
+    const rect = canvas.getBoundingClientRect();
+    return {
+      x: -pan.x / zoom,
+      y: -pan.y / zoom,
+      width: rect.width / zoom,
+      height: rect.height / zoom
+    };
+  }, [pan.x, pan.y, zoom]);
+
+  const getGuideViewport = useCallback(() => {
+    const base = getViewportBounds();
+    return {
+      x: base.x - SMART_GUIDE_VIEWPORT_PADDING,
+      y: base.y - SMART_GUIDE_VIEWPORT_PADDING,
+      width: base.width + SMART_GUIDE_VIEWPORT_PADDING * 2,
+      height: base.height + SMART_GUIDE_VIEWPORT_PADDING * 2
+    };
+  }, [getViewportBounds]);
+
   const getCanvasPoint = useCallback(
     (e: React.PointerEvent<HTMLCanvasElement>) => {
       const canvas = canvasRef.current;
@@ -1072,6 +1117,12 @@ const FigmaLite = () => {
       setIsDragging(true);
       setActiveHandle(resizeHandle);
       setSelectionBox(null);
+      const guideViewport = getGuideViewport();
+      const guideBounds = collectWorldBounds(elements, {
+        excludeIds: new Set([selectedId]),
+        viewport: guideViewport
+      });
+      const guideIndex = buildSpatialIndex(guideBounds, SMART_GUIDE_CELL);
       dragRef.current = {
         mode: 'resize',
         id: selectedId,
@@ -1083,7 +1134,10 @@ const FigmaLite = () => {
         elW: selectedElement.width,
         elH: selectedElement.height,
         aspect: selectedElement.width / Math.max(1, selectedElement.height),
-        hasHistory: false
+        hasHistory: false,
+        rotation: selectedElement.rotation ?? 0,
+        guideIndex,
+        guideViewport
       };
       (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
       return;
@@ -1120,13 +1174,23 @@ const FigmaLite = () => {
       setIsDragging(true);
       setActiveHandle(null);
       setSelectionBox(null);
+      const guideViewport = getGuideViewport();
+      const guideBounds = collectWorldBounds(elements, {
+        excludeIds: new Set(validIds),
+        viewport: guideViewport
+      });
+      const guideIndex = buildSpatialIndex(guideBounds, SMART_GUIDE_CELL);
+      const guideBoundsById = collectBoundsById(elements, new Set(validIds));
       dragRef.current = {
         mode: 'move',
         ids: validIds,
         positions,
         startX: e.clientX,
         startY: e.clientY,
-        hasHistory: false
+        hasHistory: false,
+        guideIndex,
+        guideBounds: guideBoundsById,
+        guideViewport
       };
     } else {
       if (isSpacePressed || e.button === 1) {
@@ -1165,6 +1229,9 @@ const FigmaLite = () => {
     if (!dragRef.current) {
       const nextHandle = getResizeHandleAtPoint(point);
       setHoverHandle((prev) => (prev === nextHandle ? prev : nextHandle));
+      if (smartGuides) {
+        setSmartGuides(null);
+      }
       return;
     }
     const state = dragRef.current;
@@ -1178,6 +1245,35 @@ const FigmaLite = () => {
 
     if (state.mode === 'move') {
       const updates: Array<{ id: string; updates: Partial<Element> }> = [];
+      const measureMode = e.altKey || isAltPressed;
+      let snapX = 0;
+      let snapY = 0;
+
+      if (state.guideIndex && state.guideBounds && state.guideViewport) {
+        const movingBounds = unionBounds(Array.from(state.guideBounds.values()), dx, dy);
+        if (measureMode) {
+          const measureRange = Math.max(state.guideViewport.width, state.guideViewport.height);
+          const candidates = state.guideIndex.query(movingBounds, measureRange);
+          setSmartGuides({ lines: [], measurements: computeMeasurements(movingBounds, candidates) });
+        } else {
+          const candidates = state.guideIndex.query(movingBounds, SMART_GUIDE_SEARCH_PADDING);
+          const alignment = computeAlignmentGuides({
+            movingBounds,
+            candidates,
+            snapThreshold: SMART_GUIDE_SNAP,
+            allowedX: ['left', 'center', 'right'],
+            allowedY: ['top', 'centerY', 'bottom']
+          });
+          snapX = alignment.snapX?.delta ?? 0;
+          snapY = alignment.snapY?.delta ?? 0;
+          setSmartGuides({ lines: alignment.lines, measurements: [] });
+        }
+      } else if (smartGuides) {
+        setSmartGuides(null);
+      }
+
+      const snappedDx = dx + snapX;
+      const snappedDy = dy + snapY;
       if (!state.hasHistory && (dx !== 0 || dy !== 0)) {
         pushHistory();
         state.hasHistory = true;
@@ -1185,7 +1281,7 @@ const FigmaLite = () => {
       for (const id of state.ids) {
         const position = state.positions[id];
         if (!position) continue;
-        updates.push({ id, updates: { x: position.x + dx, y: position.y + dy } });
+        updates.push({ id, updates: { x: position.x + snappedDx, y: position.y + snappedDy } });
       }
 
       if (updates.length > 0) {
@@ -1208,6 +1304,7 @@ const FigmaLite = () => {
       const moveRight = state.handle.includes('e');
       const moveTop = state.handle.includes('n');
       const moveBottom = state.handle.includes('s');
+      const measureMode = e.altKey || isAltPressed;
 
       let left = state.elX;
       let right = state.elX + state.elW;
@@ -1229,9 +1326,9 @@ const FigmaLite = () => {
 
       let width = right - left;
       let height = bottom - top;
+      let primary: 'height' | 'width' | null = null;
 
       if (e.shiftKey) {
-        let primary: 'height' | 'width';
         if ((moveLeft || moveRight) && !(moveTop || moveBottom)) {
           primary = 'width';
         } else if ((moveTop || moveBottom) && !(moveLeft || moveRight)) {
@@ -1305,6 +1402,117 @@ const FigmaLite = () => {
         }
       }
 
+      let snapAppliedX = false;
+      let snapAppliedY = false;
+
+      if (state.guideIndex && state.guideViewport) {
+        const movingBounds = getRotatedBounds(
+          left + offsetX,
+          top + offsetY,
+          width,
+          height,
+          state.rotation ?? 0
+        );
+        if (measureMode) {
+          const measureRange = Math.max(state.guideViewport.width, state.guideViewport.height);
+          const candidates = state.guideIndex.query(movingBounds, measureRange);
+          setSmartGuides({ lines: [], measurements: computeMeasurements(movingBounds, candidates) });
+        } else {
+          let allowedX: Array<'center' | 'left' | 'right'> = [];
+          let allowedY: Array<'bottom' | 'centerY' | 'top'> = [];
+          if (moveLeft) allowedX.push('left');
+          if (moveRight) allowedX.push('right');
+          if (moveTop) allowedY.push('top');
+          if (moveBottom) allowedY.push('bottom');
+
+          if (primary === 'width') {
+            allowedY = [];
+          } else if (primary === 'height') {
+            allowedX = [];
+          }
+
+          const candidates = state.guideIndex.query(movingBounds, SMART_GUIDE_SEARCH_PADDING);
+          const alignment = computeAlignmentGuides({
+            movingBounds,
+            candidates,
+            snapThreshold: SMART_GUIDE_SNAP,
+            allowedX,
+            allowedY
+          });
+
+          if (alignment.snapX && (moveLeft || moveRight)) {
+            if (moveLeft && !moveRight) {
+              left = alignment.snapX.value - offsetX;
+            } else if (moveRight && !moveLeft) {
+              right = alignment.snapX.value - offsetX;
+            }
+            snapAppliedX = true;
+          }
+          if (alignment.snapY && (moveTop || moveBottom)) {
+            if (moveTop && !moveBottom) {
+              top = alignment.snapY.value - offsetY;
+            } else if (moveBottom && !moveTop) {
+              bottom = alignment.snapY.value - offsetY;
+            }
+            snapAppliedY = true;
+          }
+
+          setSmartGuides({ lines: alignment.lines, measurements: [] });
+        }
+      } else if (smartGuides) {
+        setSmartGuides(null);
+      }
+
+      if (e.shiftKey && primary) {
+        if (primary === 'width' && snapAppliedX) {
+          width = Math.max(minSize, right - left);
+          height = Math.max(minSize, width / aspect);
+          if (moveTop && !moveBottom) {
+            top = bottom - height;
+          } else if (moveBottom && !moveTop) {
+            bottom = top + height;
+          } else {
+            const centerY = state.elY + state.elH / 2;
+            top = centerY - height / 2;
+            bottom = centerY + height / 2;
+          }
+        } else if (primary === 'height' && snapAppliedY) {
+          height = Math.max(minSize, bottom - top);
+          width = Math.max(minSize, height * aspect);
+          if (moveLeft && !moveRight) {
+            left = right - width;
+          } else if (moveRight && !moveLeft) {
+            right = left + width;
+          } else {
+            const centerX = state.elX + state.elW / 2;
+            left = centerX - width / 2;
+            right = centerX + width / 2;
+          }
+        }
+      }
+
+      width = right - left;
+      height = bottom - top;
+
+      if (!e.shiftKey) {
+        if (width < minSize) {
+          width = minSize;
+          if (moveLeft && !moveRight) {
+            left = right - width;
+          } else {
+            right = left + width;
+          }
+        }
+        if (height < minSize) {
+          height = minSize;
+          if (moveTop && !moveBottom) {
+            top = bottom - height;
+          } else {
+            bottom = top + height;
+          }
+        }
+      }
+
       const nextX = Math.round(left);
       const nextY = Math.round(top);
       const nextW = Math.round(width);
@@ -1361,6 +1569,7 @@ const FigmaLite = () => {
     setActiveHandle(null);
     setHoverHandle(null);
     setSelectionBox(null);
+    setSmartGuides(null);
   };
 
   useEffect(() => {
@@ -1769,6 +1978,68 @@ const FigmaLite = () => {
       drawElement(el, 0, 0);
     }
 
+    if (smartGuides && (smartGuides.lines.length > 0 || smartGuides.measurements.length > 0)) {
+      ctx.save();
+      const guideWidth = 1 / zoom;
+      ctx.lineWidth = guideWidth;
+      ctx.strokeStyle = '#f43f5e';
+      for (const line of smartGuides.lines) {
+        ctx.beginPath();
+        if (line.orientation === 'vertical') {
+          ctx.moveTo(line.value, line.start);
+          ctx.lineTo(line.value, line.end);
+        } else {
+          ctx.moveTo(line.start, line.value);
+          ctx.lineTo(line.end, line.value);
+        }
+        ctx.stroke();
+      }
+
+      if (smartGuides.measurements.length > 0) {
+        ctx.strokeStyle = '#22c55e';
+        ctx.setLineDash([4 / zoom, 3 / zoom]);
+        for (const measure of smartGuides.measurements) {
+          ctx.beginPath();
+          if (measure.orientation === 'horizontal') {
+            ctx.moveTo(measure.start, measure.cross);
+            ctx.lineTo(measure.end, measure.cross);
+          } else {
+            ctx.moveTo(measure.cross, measure.start);
+            ctx.lineTo(measure.cross, measure.end);
+          }
+          ctx.stroke();
+        }
+        ctx.setLineDash([]);
+
+        const fontSize = 10 / zoom;
+        const paddingX = 4 / zoom;
+        const paddingY = 2 / zoom;
+        ctx.font = `${fontSize}px ui-sans-serif, system-ui, -apple-system`;
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+
+        for (const measure of smartGuides.measurements) {
+          const label = String(measure.value);
+          const labelX =
+            measure.orientation === 'horizontal'
+              ? (measure.start + measure.end) / 2
+              : measure.cross;
+          const labelY =
+            measure.orientation === 'horizontal'
+              ? measure.cross
+              : (measure.start + measure.end) / 2;
+          const metrics = ctx.measureText(label);
+          const labelWidth = metrics.width + paddingX * 2;
+          const labelHeight = fontSize + paddingY * 2;
+          ctx.fillStyle = 'rgba(15, 23, 42, 0.85)';
+          ctx.fillRect(labelX - labelWidth / 2, labelY - labelHeight / 2, labelWidth, labelHeight);
+          ctx.fillStyle = '#ffffff';
+          ctx.fillText(label, labelX, labelY);
+        }
+      }
+      ctx.restore();
+    }
+
     if (selectionBox) {
       ctx.save();
       ctx.strokeStyle = '#3b82f6';
@@ -1780,7 +2051,7 @@ const FigmaLite = () => {
     }
 
     ctx.restore();
-  }, [elements, pan.x, pan.y, selectedIds, selectionBox, zoom]);
+  }, [elements, pan.x, pan.y, selectedIds, selectionBox, smartGuides, zoom]);
 
   useEffect(() => {
     drawScene();
@@ -1802,6 +2073,10 @@ const FigmaLite = () => {
 
     const handleKeyDown = (e: KeyboardEvent) => {
       if (isEditableTarget(e.target)) return;
+
+      if (e.code === 'AltLeft' || e.code === 'AltRight') {
+        setIsAltPressed(true);
+      }
 
       if (e.code === 'Space') {
         e.preventDefault();
@@ -1916,6 +2191,9 @@ const FigmaLite = () => {
     const handleKeyUp = (e: KeyboardEvent) => {
       if (e.code === 'Space') {
         setIsSpacePressed(false);
+      }
+      if (e.code === 'AltLeft' || e.code === 'AltRight') {
+        setIsAltPressed(false);
       }
     };
 
